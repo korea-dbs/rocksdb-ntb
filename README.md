@@ -54,24 +54,12 @@ make -j"$(nproc)" worker_main   # worker branch, on the worker
 
 ## Run
 
-1. On the primary, start `db_bench` with remote compaction enabled
-   (see the switches below).
+1. On the primary, start `db_bench` with remote compaction enabled.
 2. On the worker, start the worker after `db_bench` is running:
 
 ```
 RC_WSUB=8 ./worker_main --primary-node <NTB node id of the primary>
 ```
-
-## Install-path switches (primary, environment variables)
-
-| Variable | Effect | Default |
-|----------|--------|---------|
-| `RC_L0_REMOTE_PCT`   | Percentage of L0->L1 compactions offloaded | |
-| `RC_FINISH_THREADS`  | Number of install threads (1-54) | 54 |
-| `RC_PERSIST_SERIAL`  | `1`: write a job's output SSTs one by one | parallel |
-| `RC_SERIAL_MANIFEST` | `1`: single MANIFEST write queue | parallel queues |
-| `RC_PERSIST_DIRECT`  | Write output SSTs with `O_DIRECT` | on |
-| `RC_PERSIST_DEFER`   | `1`: defer output `fdatasync` to a background thread (measurement only, not crash-safe) | off |
 
 ## License
 
