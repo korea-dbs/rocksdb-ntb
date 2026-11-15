@@ -285,6 +285,8 @@ void DBImpl::FindObsoleteFiles(JobContext* job_context, bool force,
 
   if (doing_the_full_scan) {
     versions_->AddLiveFiles(&job_context->sst_live, &job_context->blob_live);
+    // from the full-scan backstop deletion path.
+    versions_->AddPendingObsoleteFileNumbers(&job_context->sst_live);
     InfoLogPrefix info_log_prefix(!immutable_db_options_.db_log_dir.empty(),
                                   dbname_);
     // PurgeObsoleteFiles will dedupe duplicate files.

@@ -143,6 +143,7 @@ class SubcompactionState;
 class CompactionJob {
  public:
   // Constant false aborted flag, used for compaction service jobs
+  void CleanupCompaction();
   static const std::atomic<int> kCompactionAbortedFalse;
 
   CompactionJob(int job_id, Compaction* compaction,
@@ -217,7 +218,6 @@ class CompactionJob {
 
   void LogCompaction();
   virtual void RecordCompactionIOStats();
-  void CleanupCompaction();
 
   // Iterate through input and compact the kv-pairs.
   void ProcessKeyValueCompaction(SubcompactionState* sub_compact);

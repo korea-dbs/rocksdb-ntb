@@ -552,6 +552,11 @@ bool Compaction::InputCompressionMatchesOutput() const {
 }
 
 bool Compaction::IsTrivialMove() const {
+  static const bool kNoTrivialMove =
+      (getenv("RDB_TEST_NO_TRIVIAL_MOVE") != nullptr);
+  if (kNoTrivialMove) {
+    return false;
+  }
   // Avoid a move if there is lots of overlapping grandparent data.
   // Otherwise, the move could create a parent file that will require
   // a very expensive merge later on.

@@ -12,6 +12,7 @@
 #include "db/builder.h"
 #include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
+#include "util/coding.h"
 #include "db/periodic_task_scheduler.h"
 #include "db/version_util.h"
 #include "env/composite_env_wrapper.h"
@@ -353,6 +354,13 @@ Status DBImpl::NewDB(std::vector<std::string>* new_filenames) {
     log::Writer log(std::move(file_writer), 0, false);
     std::string record;
     new_db_edit.EncodeTo(&record);
+    {
+      uint64_t mseq = versions_->NextManifestSeq();
+      std::string seq_prefixed;
+      PutFixed64(&seq_prefixed, mseq);
+      seq_prefixed.append(record);
+      record = std::move(seq_prefixed);
+    }
     s = log.AddRecord(write_options, record);
     if (s.ok()) {
       s = SyncManifest(&immutable_db_options_, write_options, log.file());
@@ -2072,7 +2080,7 @@ Status DBImpl::WriteLevel0TableForRecovery(int job_id, ColumnFamilyData* cfd,
 
   FileMetaData meta;
   std::vector<BlobFileAddition> blob_file_additions;
-
+  fprintf(stderr, "[rc] CAPTURE_FROM_Open\n");
   std::unique_ptr<std::list<uint64_t>::iterator> pending_outputs_inserted_elem(
       new std::list<uint64_t>::iterator(
           CaptureCurrentFileNumberInPendingOutputs()));

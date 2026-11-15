@@ -18,14 +18,21 @@ namespace ROCKSDB_NAMESPACE {
 struct FileMetaData;
 
 class VersionEditHandlerBase {
+ protected:
+  uint64_t last_seen_manifest_seq_ = 0;
+
+
  public:
   explicit VersionEditHandlerBase(const ReadOptions& read_options)
       : read_options_(read_options),
         max_manifest_read_size_(std::numeric_limits<uint64_t>::max()) {}
 
+  uint64_t GetLastSeenManifestSeq() const { return last_seen_manifest_seq_; }
+
   virtual ~VersionEditHandlerBase() {}
 
-  void Iterate(log::Reader& reader, Status* log_read_status);
+  void Iterate(log::Reader& reader, Status* log_read_status,
+               const std::vector<log::Reader*>& extra_readers = {});
 
   const Status& status() const { return status_; }
 

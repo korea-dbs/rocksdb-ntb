@@ -27,6 +27,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <mutex>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -1394,6 +1395,10 @@ class VersionSet {
   // Return the current manifest file number
   uint64_t manifest_file_number() const { return manifest_file_number_; }
 
+  uint64_t NextManifestSeq() {
+    return global_manifest_seq_.fetch_add(1, std::memory_order_relaxed);
+  }
+
   uint64_t options_file_number() const { return options_file_number_; }
 
   uint64_t pending_manifest_file_number() const {
@@ -1806,11 +1811,46 @@ class VersionSet {
   // Opened lazily
   std::unique_ptr<log::Writer> descriptor_log_;
 
+  std::atomic<uint64_t> global_manifest_seq_{0};
+
+  static constexpr int kNumRemoteQueues = 9;
+  std::unique_ptr<log::Writer> descriptor_log_remote_[kNumRemoteQueues];
+  uint64_t manifest_file_number_remote_ = 0;
+  uint64_t pending_manifest_file_number_remote_ = 0;
+  uint64_t manifest_file_size_remote_ = 0;
+  std::deque<ManifestWriter*> manifest_writers_remote_[kNumRemoteQueues];
+
+  static constexpr int kLocalQueueIdx = kNumRemoteQueues;
+  static constexpr int kNumManifestQueues = kNumRemoteQueues + 1;
+  std::atomic<uint64_t> queue_assigned_mseq_[kNumManifestQueues] = {};
+  std::atomic<uint64_t> queue_durable_mseq_[kNumManifestQueues] = {};
+
+  std::atomic<bool> queue_permanently_stuck_[kNumManifestQueues] = {};
+
+  uint64_t GetSafePurgeMseqWatermark() const {
+    uint64_t min_watermark = UINT64_MAX;
+    for (int q = 0; q < kNumManifestQueues; q++) {
+      bool stuck = queue_permanently_stuck_[q].load(std::memory_order_acquire);
+      uint64_t assigned = queue_assigned_mseq_[q].load(std::memory_order_acquire);
+      uint64_t durable = queue_durable_mseq_[q].load(std::memory_order_acquire);
+      if (!stuck && assigned == durable) {
+        continue;
+      }
+      if (durable < min_watermark) {
+        min_watermark = durable;
+      }
+    }
+    return min_watermark;
+  }
+
   // generates a increasing version number for every new version
   uint64_t current_version_number_;
 
   // Queue of writers to the manifest file
   std::deque<ManifestWriter*> manifest_writers_;
+  std::mutex deferred_manifest_mu_;
+  std::deque<std::string> pending_deferred_records_;
+  static constexpr size_t kDeferBacklogLimit = 20;
 
   // Current size of manifest file
   uint64_t manifest_file_size_;
@@ -1848,6 +1888,44 @@ class VersionSet {
   std::vector<ObsoleteBlobFileInfo> obsolete_blob_files_;
   std::vector<std::string> obsolete_manifests_;
 
+  std::vector<ObsoleteFileInfo> pending_obsolete_files_;
+
+  void SweepPendingObsoleteFiles() {
+    if (pending_obsolete_files_.empty()) return;
+    uint64_t watermark = GetSafePurgeMseqWatermark();
+    std::vector<ObsoleteFileInfo> still_pending;
+    still_pending.reserve(pending_obsolete_files_.size());
+    for (auto& info : pending_obsolete_files_) {
+      bool safe = (info.metadata == nullptr) ||
+                  (info.metadata->obsoleted_at_mseq_ == UINT64_MAX) ||
+                  (info.metadata->obsoleted_at_mseq_ <= watermark);
+      if (safe) {
+        fprintf(stderr,
+               "[obsolete-defer] file=%llu obsoleted_at_mseq=%llu watermark=%llu -> SWEPT(promoted)\n",
+               info.metadata ? (unsigned long long)info.metadata->fd.GetNumber() : 0ULL,
+               info.metadata ? (unsigned long long)info.metadata->obsoleted_at_mseq_ : 0ULL,
+               (unsigned long long)watermark);
+        obsolete_files_.push_back(std::move(info));
+      } else {
+        still_pending.push_back(std::move(info));
+      }
+    }
+    pending_obsolete_files_.swap(still_pending);
+  }
+
+  // full-scan backstop (DBImpl::FindObsoleteFiles/PurgeObsoleteFiles) doesn't
+  // physically delete files we've deliberately deferred via obsoleted_at_mseq_.
+  // Without this, the full-scan path compares disk files only against the
+  // CURRENT live version's file list, which doesn't know about our deferred
+  // pending list, and deletes them anyway.
+  void AddPendingObsoleteFileNumbers(std::vector<uint64_t>* live_list) const {
+    for (const auto& info : pending_obsolete_files_) {
+      if (info.metadata != nullptr) {
+        live_list->push_back(info.metadata->fd.GetNumber());
+      }
+    }
+  }
+
   // env options for all reads and writes except compactions
   FileOptions file_options_;
 
@@ -1875,6 +1953,12 @@ class VersionSet {
                                const ColumnFamilyOptions* new_cf_options,
                                const ReadOptions& read_options,
                                const WriteOptions& write_options);
+
+  Status ProcessManifestWritesRemote(std::deque<ManifestWriter>& writers,
+                                     InstrumentedMutex* mu,
+                                     const ReadOptions& read_options,
+                                     const WriteOptions& write_options,
+                                     int remote_idx);
 
   void LogAndApplyCFHelper(VersionEdit* edit,
                            SequenceNumber* max_last_sequence);

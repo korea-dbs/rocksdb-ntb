@@ -323,13 +323,20 @@ bool CompactionPicker::RangeOverlapWithCompaction(
     int level) const {
   const Comparator* ucmp = icmp_->user_comparator();
   for (Compaction* c : compactions_in_progress_) {
-    if (c->output_level() == level &&
-        ucmp->CompareWithoutTimestamp(smallest_user_key,
-                                      c->GetLargestUserKey()) <= 0 &&
-        ucmp->CompareWithoutTimestamp(largest_user_key,
-                                      c->GetSmallestUserKey()) >= 0) {
-      // Overlap
-      return true;
+    if (c->output_level() == level) {
+      if (ucmp->CompareWithoutTimestamp(smallest_user_key,
+                                        c->GetLargestUserKey()) <= 0 &&
+          ucmp->CompareWithoutTimestamp(largest_user_key,
+                                        c->GetSmallestUserKey()) >= 0) {
+        return true;
+      }
+      if (c->HasOutputRange() &&
+          ucmp->CompareWithoutTimestamp(smallest_user_key,
+                                        c->GetOutputLargestUserKey()) <= 0 &&
+          ucmp->CompareWithoutTimestamp(largest_user_key,
+                                        c->GetOutputSmallestUserKey()) >= 0) {
+        return true;
+      }
     }
     if (c->SupportsPerKeyPlacement()) {
       if (c->OverlapProximalLevelOutputRange(smallest_user_key,

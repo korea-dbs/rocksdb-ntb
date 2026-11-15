@@ -44,13 +44,15 @@ class InstrumentedMutex {
 
   void Lock();
 
-  void Unlock() { mutex_.Unlock(); }
+  void Unlock();
 
   void AssertHeld() const { mutex_.AssertHeld(); }
 
  private:
   void LockInternal();
   friend class InstrumentedCondVar;
+  uint64_t mh_start_ns_ = 0;
+  void* mh_lock_ra_ = nullptr;
   port::Mutex mutex_;
   Statistics* stats_;
   SystemClock* clock_;
@@ -101,7 +103,8 @@ class InstrumentedMutexUnlock {
 class InstrumentedCondVar {
  public:
   explicit InstrumentedCondVar(InstrumentedMutex* instrumented_mutex)
-      : cond_(&(instrumented_mutex->mutex_)),
+      : mh_mu_(instrumented_mutex),
+        cond_(&(instrumented_mutex->mutex_)),
         stats_(instrumented_mutex->stats_),
         clock_(instrumented_mutex->clock_),
         stats_code_(instrumented_mutex->stats_code_) {}
@@ -117,6 +120,7 @@ class InstrumentedCondVar {
  private:
   void WaitInternal();
   bool TimedWaitInternal(uint64_t abs_time_us);
+  InstrumentedMutex* mh_mu_;
   port::CondVar cond_;
   Statistics* stats_;
   SystemClock* clock_;

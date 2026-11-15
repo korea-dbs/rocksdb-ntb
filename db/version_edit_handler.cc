@@ -9,7 +9,11 @@
 
 #include "db/version_edit_handler.h"
 
+#include "util/coding.h"
+
+#include <algorithm>
 #include <cinttypes>
+#include <vector>
 #include <sstream>
 
 #include "db/blob/blob_file_reader.h"
@@ -22,25 +26,118 @@
 namespace ROCKSDB_NAMESPACE {
 
 void VersionEditHandlerBase::Iterate(log::Reader& reader,
-                                     Status* log_read_status) {
-  Slice record;
-  std::string scratch;
+                                     Status* log_read_status,
+                                     const std::vector<log::Reader*>& extra_readers) {
+  Slice record, record2;
+  std::string scratch, scratch2;
   assert(log_read_status);
   assert(log_read_status->ok());
 
+  log::Reader* err_reader = &reader;
   [[maybe_unused]] size_t recovered_edits = 0;
   Status s = Initialize();
-  while (reader.LastRecordEnd() < max_manifest_read_size_ && s.ok() &&
-         reader.ReadRecord(&record, &scratch) && log_read_status->ok()) {
+
+  struct PendingRecord {
+    uint64_t seq;
     VersionEdit edit;
-    s = edit.DecodeFrom(record);
-    if (s.ok()) {
-      last_valid_record_end_ = reader.LastRecordEnd();
-      s = read_buffer_.AddEdit(&edit);
+    bool from_local;
+  };
+  std::vector<PendingRecord> pending;
+
+  auto drain = [&](log::Reader* rd, bool is_local) {
+    Slice rec;
+    std::string sc;
+    while (s.ok() && log_read_status->ok()) {
+      if (is_local && rd->LastRecordEnd() >= max_manifest_read_size_) {
+        break;
+      }
+      if (!rd->ReadRecord(&rec, &sc)) {
+        break;
+      }
+      err_reader = rd;
+      Slice body = rec;
+      uint64_t seq = 0;
+      if (body.size() >= 8) {
+        seq = DecodeFixed64(body.data());
+        body.remove_prefix(8);
+      }
+      VersionEdit edit;
+      s = edit.DecodeFrom(body);
+      if (!s.ok()) {
+        break;
+      }
+      if (is_local) {
+        last_valid_record_end_ = rd->LastRecordEnd();
+      }
+      pending.push_back(PendingRecord{seq, std::move(edit), is_local});
     }
-    if (s.ok()) {
+  };
+
+  if (s.ok()) {
+    drain(&reader, true);
+  }
+  for (log::Reader* er : extra_readers) {
+    if (!s.ok() || !log_read_status->ok()) {
+      break;
+    }
+    if (er != nullptr) {
+      drain(er, false);
+    }
+  }
+
+  if (s.ok() && log_read_status->ok()) {
+    std::stable_sort(pending.begin(), pending.end(),
+                     [](const PendingRecord& a, const PendingRecord& b) {
+                       return a.seq < b.seq;
+                     });
+
+    bool seq_gap_detected = false;
+    uint64_t expected_next_seq = 0;
+    bool expected_seq_initialized = false;
+
+    for (auto& pr : pending) {
+      if (!s.ok()) {
+        break;
+      }
+      if (seq_gap_detected) {
+        break;
+      }
+      if (!expected_seq_initialized) {
+        expected_next_seq = pr.seq;
+        expected_seq_initialized = true;
+      }
+      if (pr.seq != expected_next_seq) {
+        fprintf(stderr,
+               "[recovery-gap] GAP DETECTED: expected_seq=%llu got_seq=%llu "
+               "src=%s -> replay 중단, 마지막 gap-free 상태로 롤백\n",
+               (unsigned long long)expected_next_seq,
+               (unsigned long long)pr.seq, pr.from_local ? "local" : "remote");
+        seq_gap_detected = true;
+        break;
+      }
+      expected_next_seq = pr.seq + 1;
+
+      if (pr.seq < last_seen_manifest_seq_) {
+        fprintf(stderr,
+               "[manifest_seq] OUT OF ORDER (unexpected after sort)! "
+               "seq=%llu last_seen=%llu\n",
+               (unsigned long long)pr.seq,
+               (unsigned long long)last_seen_manifest_seq_);
+      }
+      static uint64_t g_seq_record_count = 0;
+      g_seq_record_count++;
+      fprintf(stderr, "[manifest_seq] record#%llu seq=%llu src=%s (sorted)\n",
+             (unsigned long long)g_seq_record_count,
+             (unsigned long long)pr.seq, pr.from_local ? "local" : "remote");
+      last_seen_manifest_seq_ = pr.seq;
+
+      s = read_buffer_.AddEdit(&pr.edit);
+      if (!s.ok()) {
+        break;
+      }
+
       ColumnFamilyData* cfd = nullptr;
-      if (edit.IsInAtomicGroup()) {
+      if (pr.edit.IsInAtomicGroup()) {
         if (read_buffer_.IsFull()) {
           s = OnAtomicGroupReplayBegin();
           for (size_t i = 0; s.ok() && i < read_buffer_.replay_buffer().size();
@@ -57,7 +154,7 @@ void VersionEditHandlerBase::Iterate(log::Reader& reader,
           }
         }
       } else {
-        s = ApplyVersionEdit(edit, &cfd);
+        s = ApplyVersionEdit(pr.edit, &cfd);
         if (s.ok()) {
           recovered_edits++;
         }
@@ -76,7 +173,7 @@ void VersionEditHandlerBase::Iterate(log::Reader& reader,
       // wrong with the underlying file. in this case we
       // want to report the filename, so in here we append
       // the filename to the Corruption message
-      assert(reader.file());
+      assert(err_reader->file());
 
       // build a new error message
       std::stringstream message;
@@ -87,7 +184,7 @@ void VersionEditHandlerBase::Iterate(log::Reader& reader,
         message << ' ';
       }
       // append the filename to the corruption message
-      message << " The file " << reader.file()->file_name()
+      message << " The file " << err_reader->file()->file_name()
               << " may be corrupted.";
       // overwrite the status with the extended status
       s = Status(s.code(), s.subcode(), s.severity(), message.str());
@@ -624,7 +721,8 @@ Status VersionEditHandler::ExtractInfoFromVersionEdit(ColumnFamilyData* cfd,
       version_edit_params_.SetPrevLogNumber(edit.GetPrevLogNumber());
     }
     if (edit.HasNextFile()) {
-      version_edit_params_.SetNextFile(edit.GetNextFile());
+      version_edit_params_.SetNextFile(
+          std::max(version_edit_params_.GetNextFile(), edit.GetNextFile()));
     }
     if (edit.HasMaxColumnFamily()) {
       version_edit_params_.SetMaxColumnFamily(edit.GetMaxColumnFamily());

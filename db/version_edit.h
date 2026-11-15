@@ -273,6 +273,14 @@ struct FileMetaData {
 
   int refs = 0;  // Reference count
 
+  // the manifest edit that first marked this file deleted (i.e. the mseq
+  // passed to AppendVersion in ProcessManifestWrites/ProcessManifestWritesRemote
+  // when edit->GetDeletedFiles() contained this file). UINT64_MAX means "not
+  // yet marked obsolete by any edit". Version::~Version() checks this against
+  // VersionSet's durable watermark before physically deleting the file, to
+  // avoid deleting a file whose obsoleting edit hasn't reached disk yet.
+  uint64_t obsoleted_at_mseq_ = UINT64_MAX;
+
   bool being_compacted = false;       // Is this file undergoing compaction?
   bool init_stats_from_file = false;  // true if the data-entry stats of this
                                       // file has initialized from file.
@@ -980,6 +988,12 @@ class VersionEdit {
 
   void MarkNoManifestWriteDummy() { is_no_manifest_write_dummy_ = true; }
   bool IsNoManifestWriteDummy() const { return is_no_manifest_write_dummy_; }
+  void MarkDeferManifestSync(int queue_idx = 0) {
+    defer_manifest_sync_ = true;
+    defer_queue_idx_ = queue_idx;
+  }
+  bool IsDeferManifestSync() const { return defer_manifest_sync_; }
+  int GetDeferQueueIdx() const { return defer_queue_idx_; }
 
   void MarkAtomicGroup(uint32_t remaining_entries) {
     is_in_atomic_group_ = true;
@@ -1116,6 +1130,8 @@ class VersionEdit {
   uint32_t remaining_entries_ = 0;
   bool is_in_atomic_group_ = false;
   bool is_no_manifest_write_dummy_ = false;
+  bool defer_manifest_sync_ = false;
+  int defer_queue_idx_ = 0;
 
   std::string full_history_ts_low_;
   bool persist_user_defined_timestamps_ = true;
