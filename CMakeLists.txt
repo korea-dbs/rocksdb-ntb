@@ -708,7 +708,7 @@ if(USE_FOLLY)
   endif()
 endif()
 find_package(Threads REQUIRED)
-set(SISCI_ROOT "/opt/DIS" CACHE PATH "Dolphin SISCI 설치 경로")
+set(SISCI_ROOT "/opt/DIS" CACHE PATH "Dolphin SISCI install path")
 find_library(SISCI_LIB sisci
   HINTS ${SISCI_ROOT}/lib64 ${SISCI_ROOT}/lib
   REQUIRED)
