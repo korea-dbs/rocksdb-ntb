@@ -1773,3 +1773,54 @@ option(WITH_BENCHMARK "build benchmark tests" OFF)
 if(WITH_BENCHMARK)
   add_subdirectory(${PROJECT_SOURCE_DIR}/microbench/)
 endif()
+#gyu add
+set(SISCI_ROOT "/opt/DIS" CACHE PATH "Dolphin SISCI 설치 경로")
+find_library(SISCI_LIB sisci
+  HINTS ${SISCI_ROOT}/lib64 ${SISCI_ROOT}/lib
+  REQUIRED)
+
+set(SISCI_INCS
+  ${SISCI_ROOT}/include
+  ${SISCI_ROOT}/include/dis
+)
+
+set(RC_SHARED_SRC
+  remote_compaction/shared/compaction_spec.cc
+  remote_compaction/shared/ntb_channel.cc
+)
+
+add_executable(worker_main
+  ${RC_SHARED_SRC}
+  remote_compaction/worker_only/worker_server.cc
+  remote_compaction/worker_only/worker_main.cc
+)
+target_include_directories(worker_main PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/remote_compaction
+  ${SISCI_INCS}
+)
+target_link_libraries(worker_main PRIVATE
+  rocksdb ${SISCI_LIB} pthread dl z snappy lz4 zstd
+)
+target_compile_options(worker_main PRIVATE
+  -Wall -Wextra -Wno-unused-parameter -O2 -g
+)
+
+add_library(remote_compaction_primary STATIC
+  ${RC_SHARED_SRC}
+  remote_compaction/primary_only/compaction_dispatcher.cc
+  remote_compaction/primary_only/remote_compaction_job.cc
+)
+target_include_directories(remote_compaction_primary PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${CMAKE_CURRENT_SOURCE_DIR}/remote_compaction
+  ${SISCI_INCS}
+)
+target_link_libraries(remote_compaction_primary PUBLIC
+  rocksdb ${SISCI_LIB} pthread
+)
+target_compile_options(remote_compaction_primary PRIVATE
+  -Wall -Wextra -Wno-unused-parameter -O2 -g
+)
