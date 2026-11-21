@@ -552,6 +552,13 @@ bool Compaction::InputCompressionMatchesOutput() const {
 }
 
 bool Compaction::IsTrivialMove() const {
+  // gyu modify: RDB_TEST_NO_TRIVIAL_MOVE 가 설정되면 트리비얼 무브를 막아서
+  // 모든 레벨 이동을 실제 컴팩션으로 만든다 (리모트 오프로딩 테스트용).
+  static const bool kNoTrivialMove =
+      (getenv("RDB_TEST_NO_TRIVIAL_MOVE") != nullptr);
+  if (kNoTrivialMove) {
+    return false;
+  }
   // Avoid a move if there is lots of overlapping grandparent data.
   // Otherwise, the move could create a parent file that will require
   // a very expensive merge later on.

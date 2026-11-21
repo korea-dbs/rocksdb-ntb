@@ -2398,14 +2398,38 @@ Status CompactionJob::InstallCompactionResults(bool* compaction_released) {
     *compaction_released = true;
   };
 
+  // TEST ONLY: force every other local compaction to route through
+  // manifest_writers_remote_ (same flag remote_compaction_job.cc uses for
+  // real remote results), so the dual-queue parallel manifest commit path
+  // gets exercised purely from local compactions -- no NTB/remote worker
+  // needed. Enable with RDB_TEST_DUAL_MANIFEST_QUEUE=1 in the environment.
+  {
+    static const bool kTestDualQueue =
+        (getenv("RDB_TEST_DUAL_MANIFEST_QUEUE") != nullptr);
+    if (kTestDualQueue) {
+      static std::atomic<uint64_t> g_test_compaction_count{0};
+      uint64_t n = g_test_compaction_count.fetch_add(1) + 1;
+      if (n % 5 != 0) {
+        // gyu modify: v48 리모트 큐 9개 중 하나로 라운드로빈
+        int test_idx = static_cast<int>(n % 9);
+        edit->MarkDeferManifestSync(test_idx);
+        fprintf(stderr,
+               "[test] local compaction #%llu forced onto remote manifest queue idx=%d\n",
+               (unsigned long long)n, test_idx);
+      }
+    }
+  }
+
   Status s;
   TEST_SYNC_POINT_CALLBACK(
       "CompactionJob::InstallCompactionResults:BeforeLogAndApply", &s);
+  auto t_lna_start = std::chrono::steady_clock::now();
   if (s.ok()) {
     s = versions_->LogAndApply(compaction->column_family_data(), read_options,
                                write_options, edit, db_mutex_, db_directory_,
                                /*new_descriptor_log=*/false,
                                /*column_family_options=*/nullptr, manifest_wcb);
+  fprintf(stderr, "[timing] local logandapply=%lldms level=%d\n", (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_lna_start).count(), compaction->output_level());
   }
   return s;
 }

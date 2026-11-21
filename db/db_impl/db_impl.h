@@ -203,6 +203,15 @@ class DBImpl : public DB {
   DBImpl(const DBImpl&) = delete;
   void operator=(const DBImpl&) = delete;
 
+  // remote compaction용 public 래퍼
+  std::list<uint64_t>::iterator CaptureCurrentFileNumberInPendingOutputsForRemote() {
+    return CaptureCurrentFileNumberInPendingOutputs();
+  }
+  void ReleaseFileNumberFromPendingOutputsForRemote(
+      std::unique_ptr<std::list<uint64_t>::iterator> v) {
+    ReleaseFileNumberFromPendingOutputs(v);
+  }
+
   virtual ~DBImpl();
 
   // ---- Implementations of the DB interface ----
@@ -2227,6 +2236,8 @@ class DBImpl : public DB {
   // pending_outputs_. This will prevent any background process to delete any
   // file created after this point.
   std::list<uint64_t>::iterator CaptureCurrentFileNumberInPendingOutputs();
+
+
   // This function should be called with the result of
   // CaptureCurrentFileNumberInPendingOutputs(). It then marks that any file
   // created between the calls CaptureCurrentFileNumberInPendingOutputs() and
@@ -2667,9 +2678,10 @@ class DBImpl : public DB {
   void BackgroundCallFlush(Env::Priority thread_pri);
   void BackgroundCallPurge();
   Status BackgroundCompaction(bool* madeProgress, JobContext* job_context,
-                              LogBuffer* log_buffer,
-                              PrepickedCompaction* prepicked_compaction,
-                              Env::Priority thread_pri);
+		  LogBuffer* log_buffer,
+		  PrepickedCompaction* prepicked_compaction,
+		  Env::Priority thread_pri,
+		  std::function<void()> on_async_done = nullptr);
   Status BackgroundFlush(bool* madeProgress, JobContext* job_context,
                          LogBuffer* log_buffer, FlushReason* reason,
                          bool* flush_rescheduled_to_retain_udt,
@@ -3301,6 +3313,8 @@ class DBImpl : public DB {
   // it up.
   // State is protected with db mutex.
   std::list<uint64_t> pending_outputs_;
+  std::list<uint64_t>::iterator rc_async_pending_iter_;
+  bool rc_async_pending_valid_ = false; //gyu add
 
   // Similar to pending_outputs_, FindObsoleteFiles()/PurgeObsoleteFiles() never
   // deletes any OPTIONS file that has number bigger than any of the file number

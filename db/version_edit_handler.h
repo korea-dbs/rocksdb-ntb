@@ -18,14 +18,28 @@ namespace ROCKSDB_NAMESPACE {
 struct FileMetaData;
 
 class VersionEditHandlerBase {
+ protected:
+  // v38: 병렬 매니페스트 설계 1단계 — 읽은 레코드의 시퀀스 번호가 항상
+  // 증가하는지 검증용 (지금은 파일이 1개라 반드시 단조증가해야 함).
+  uint64_t last_seen_manifest_seq_ = 0;
+
+
  public:
   explicit VersionEditHandlerBase(const ReadOptions& read_options)
       : read_options_(read_options),
         max_manifest_read_size_(std::numeric_limits<uint64_t>::max()) {}
 
+  // gyu modify: v49 - 복구 후 global_manifest_seq_를 이어서 발급하기 위해
+  // Iterate()가 마지막으로 본 seq를 밖에서 읽을 수 있게 하는 접근자.
+  uint64_t GetLastSeenManifestSeq() const { return last_seen_manifest_seq_; }
+
   virtual ~VersionEditHandlerBase() {}
 
-  void Iterate(log::Reader& reader, Status* log_read_status);
+  // gyu modify: v48 N-way 매니페스트 큐 — extra_readers로 넘어온 N개의
+  // 스트림을 모두 읽어서 시퀀스 번호 기준으로 정렬 후 재생한다(비어 있으면
+  // 기존과 동일한 단일 스트림 재생).
+  void Iterate(log::Reader& reader, Status* log_read_status,
+               const std::vector<log::Reader*>& extra_readers = {});
 
   const Status& status() const { return status_; }
 

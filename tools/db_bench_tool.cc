@@ -10,6 +10,7 @@
 #ifdef GFLAGS
 #ifdef NUMA
 #include <numa.h>
+#include <fstream>
 #endif
 #ifndef OS_WIN
 #include <unistd.h>
@@ -28,6 +29,7 @@
 #include <sys/sysctl.h>
 #endif
 #include <atomic>
+#include <csignal>
 #include <cinttypes>
 #include <condition_variable>
 #include <cstddef>
@@ -103,6 +105,7 @@
 #ifdef OS_WIN
 #include <io.h>  // open/close
 #endif
+#include "env/manifest_redirect_fs.h"
 
 using GFLAGS_NAMESPACE::ParseCommandLineFlags;
 using GFLAGS_NAMESPACE::RegisterFlagValidator;
@@ -262,6 +265,9 @@ DEFINE_string(
     "\tapproximatememtablestats -- Tests accuracy of "
     "GetApproximateMemTableStats, ideally\n"
     "after fillrandom, where actual answer is batch_size");
+
+DEFINE_string(twitter_trace_prefix, "",
+              "twitterreplay: per-thread trace files <prefix>.<tid>");
 
 DEFINE_int64(num, 1000000, "Number of key/values to place in database");
 
@@ -1969,6 +1975,8 @@ DEFINE_uint32(openandcompact_cancel_after_millseconds, 1,
               "openandcompact_test_cancel_on_odd is true");
 
 namespace ROCKSDB_NAMESPACE {
+static std::atomic<bool> g_bench_stop_requested{false};
+static void BenchOnSignal(int) { g_bench_stop_requested.store(true, std::memory_order_relaxed); }
 namespace {
 static Status CreateMemTableRepFactory(
     const ConfigOptions& config_options,
@@ -3760,6 +3768,9 @@ class Benchmark {
         fresh_db = true;
         entries_per_batch_ = 1000;
         method = &Benchmark::WriteSeq;
+    } else if (name == "twitterreplay") {
+      fresh_db = true;
+      method = &Benchmark::TwitterReplay;
       } else if (name == "fillrandom") {
         fresh_db = true;
         method = &Benchmark::WriteRandom;
@@ -4995,6 +5006,7 @@ class Benchmark {
               "enabling it automatically\n");
     }
     options.skip_stats_update_on_db_open = FLAGS_skip_stats_update_on_db_open;
+    if (const char* rc_e = getenv("RC_NO_FALLOCATE"); rc_e && *rc_e == '1') { options.allow_fallocate = false; fprintf(stderr, "[rc] v-nofalloc: allow_fallocate=false\n"); }  // v-nofalloc
     options.optimize_filters_for_hits = FLAGS_optimize_filters_for_hits;
     options.paranoid_checks = FLAGS_paranoid_checks;
     options.force_consistency_checks = FLAGS_force_consistency_checks;
@@ -5124,6 +5136,17 @@ class Benchmark {
     // a guaranteed failure when they are needed.
     options.create_missing_column_families = true;
     options.create_if_missing = true;
+
+    if ([] { const char* e = getenv("RC_MANIFEST_TMPFS"); bool v = !(e && atoi(e) == 0);  // v-mfdisk
+          fprintf(stderr, "[rc] manifest location: %s\n", v ? "tmpfs (/dev/shm/manifest_tmpfs)" : "db dir (disk)");
+          return v; }()) {
+      static std::shared_ptr<FileSystem> manifest_redirect_fs =
+          std::make_shared<ManifestRedirectFS>(FileSystem::Default(),
+                                               "/dev/shm/manifest_tmpfs");
+      static std::unique_ptr<Env> manifest_redirect_env =
+          NewCompositeEnv(manifest_redirect_fs);
+      options.env = manifest_redirect_env.get();
+    }
 
     if (options.statistics == nullptr) {
       options.statistics = dbstats;
@@ -5432,6 +5455,78 @@ class Benchmark {
   }
 
   void WriteSeq(ThreadState* thread) { DoWrite(thread, SEQUENTIAL); }
+
+  // Twitter cache-trace replay. line: ts,key,key_size,value_size,client,op,ttl
+  // get/gets->Get, delete->Delete, others(set/add/replace/cas/append/
+  // prepend/incr/decr)->Put. Timestamps ignored (replay as fast as possible).
+  void TwitterReplay(ThreadState* thread) {
+    const std::string path =
+        FLAGS_twitter_trace_prefix + "." + std::to_string(thread->tid);
+    std::ifstream in(path);
+    if (!in.is_open()) {
+      fprintf(stderr, "twitterreplay: cannot open %s\n", path.c_str());
+      exit(1);
+    }
+    DB* db = SelectDB(thread);
+    RandomGenerator gen;
+    std::string line, got;
+    int64_t n_put = 0, n_get = 0, n_hit = 0, n_del = 0, n_skip = 0, bytes = 0;
+    auto rfind_before = [&](size_t pos) -> size_t {
+      if (pos == std::string::npos || pos == 0) return std::string::npos;
+      return line.rfind(',', pos - 1);
+    };
+    while (std::getline(in, line)) {
+      size_t c1 = line.find(',');
+      size_t r1 = line.rfind(',');   // before ttl
+      size_t r2 = rfind_before(r1);  // before op
+      size_t r3 = rfind_before(r2);  // before client
+      size_t r4 = rfind_before(r3);  // before value_size
+      size_t r5 = rfind_before(r4);  // before key_size (end of key)
+      if (c1 == std::string::npos || r5 == std::string::npos || r5 <= c1) {
+        n_skip++;
+        continue;
+      }
+      Slice key(line.data() + c1 + 1, r5 - c1 - 1);
+      int64_t vsize = strtoll(line.c_str() + r4 + 1, nullptr, 10);
+      std::string op = line.substr(r2 + 1, r1 - r2 - 1);
+      Status st;
+      if (op == "get" || op == "gets") {
+        st = db->Get(read_options_, key, &got);
+        if (st.ok()) {
+          n_hit++;
+        } else if (st.IsNotFound()) {
+          st = Status::OK();
+        }
+        n_get++;
+        thread->stats.FinishedOps(nullptr, db, 1, kRead);
+      } else if (op == "delete") {
+        st = db->Delete(write_options_, key);
+        n_del++;
+        thread->stats.FinishedOps(nullptr, db, 1, kDelete);
+      } else {
+        if (vsize <= 0) {
+          vsize = (op == "incr" || op == "decr") ? 8 : FLAGS_value_size;
+        }
+        if (vsize >= (1 << 20)) vsize = (1 << 20) - 1;
+        st = db->Put(write_options_, key,
+                     gen.Generate(static_cast<unsigned int>(vsize)));
+        bytes += static_cast<int64_t>(key.size()) + vsize;
+        n_put++;
+        thread->stats.FinishedOps(nullptr, db, 1, kWrite);
+      }
+      if (!st.ok()) {
+        fprintf(stderr, "twitterreplay: %s\n", st.ToString().c_str());
+        exit(1);
+      }
+    }
+    thread->stats.AddBytes(bytes);
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "(put %" PRId64 " get %" PRId64 " hit %" PRId64 " del %" PRId64
+             " skip %" PRId64 ")",
+             n_put, n_get, n_hit, n_del, n_skip);
+    thread->stats.AddMessage(msg);
+  }
 
   void WriteRandom(ThreadState* thread) { DoWrite(thread, RANDOM); }
 
@@ -5841,7 +5936,7 @@ class Benchmark {
     size_t id = 0;
     int64_t num_range_deletions = 0;
 
-    while ((num_per_key_gen != 0) && !duration.Done(entries_per_batch_)) {
+    while ((num_per_key_gen != 0) && !duration.Done(entries_per_batch_) && !g_bench_stop_requested.load(std::memory_order_relaxed)) {
       if (duration.GetStage() != stage) {
         stage = duration.GetStage();
         if (db_.db != nullptr) {
@@ -9487,6 +9582,8 @@ class Benchmark {
 
 int db_bench_tool(int argc, char** argv, ToolHooks& hooks) {
   ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();
+  std::signal(SIGINT, BenchOnSignal);
+  std::signal(SIGTERM, BenchOnSignal);
   ConfigOptions config_options;
   static bool initialized = false;
   hooks_ = &hooks;

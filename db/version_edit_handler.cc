@@ -8,8 +8,14 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include "db/version_edit_handler.h"
+#include <cstdio>  // v-plainmf
+#include <cstdlib>  // v-plainmf
 
+#include "util/coding.h"
+
+#include <algorithm>
 #include <cinttypes>
+#include <vector>
 #include <sstream>
 
 #include "db/blob/blob_file_reader.h"
@@ -20,27 +26,156 @@
 #include "util/udt_util.h"
 
 namespace ROCKSDB_NAMESPACE {
+// v-plainmf: MANIFEST 레코드 형식 선택 (기본 = RocksDB 기본 형식)
+static bool RcMfPrefixed() {
+  static const bool v = [] {
+    const char* e = std::getenv("RC_MF_PREFIXED");
+    bool r = e && *e == '1';
+    std::fprintf(stderr, "[rc] v-plainmf: MANIFEST record format = %s\n", r ? "mseq-prefixed (old dma3)" : "plain (RocksDB default)");
+    return r;
+  }();
+  return v;
+}
 
+// gyu modify: v48 N-way 매니페스트 큐
 void VersionEditHandlerBase::Iterate(log::Reader& reader,
-                                     Status* log_read_status) {
-  Slice record;
-  std::string scratch;
+                                     Status* log_read_status,
+                                     const std::vector<log::Reader*>& extra_readers) {
+  Slice record, record2;
+  std::string scratch, scratch2;
   assert(log_read_status);
   assert(log_read_status->ok());
 
+  log::Reader* err_reader = &reader;
   [[maybe_unused]] size_t recovered_edits = 0;
   Status s = Initialize();
-  while (reader.LastRecordEnd() < max_manifest_read_size_ && s.ok() &&
-         reader.ReadRecord(&record, &scratch) && log_read_status->ok()) {
+
+  // v47: v39의 lookahead(1칸) 스트리밍 merge는 "각 스트림이 이미 seq
+  // 오름차순으로 정렬돼 있다"는 전제가 있어야만 정확하다. 그런데 v40/v46이
+  // mseq 발급 시점(mu 잡고 메모리에 설치할 때)과 디스크에 실제로 기록되는
+  // 시점(mu 풀고 각자 진행)을 분리시키면서, 개별 파일 내부조차 그 전제가
+  // 깨질 수 있게 됐다 (레코드가 물리적으로 뒤바뀐 순서로 기록됨). 대신
+  // 로컬/리모트 두 스트림을 전부 읽어서 메모리에 모은 뒤, seq 기준으로
+  // 정렬하고 나서 그 순서대로 replay한다. 물리적 기록 순서가 어떻든
+  // 항상 올바른(진짜 발생) 순서로 재생되며, 이 정렬은 DB Open() 시
+  // 딱 한 번만 돈다.
+  struct PendingRecord {
+    uint64_t seq;
     VersionEdit edit;
-    s = edit.DecodeFrom(record);
-    if (s.ok()) {
-      last_valid_record_end_ = reader.LastRecordEnd();
-      s = read_buffer_.AddEdit(&edit);
+    bool from_local;
+  };
+  std::vector<PendingRecord> pending;
+
+  uint64_t rc_plain_seq = 0;  // v-plainmf
+  auto drain = [&](log::Reader* rd, bool is_local) {
+    Slice rec;
+    std::string sc;
+    while (s.ok() && log_read_status->ok()) {
+      if (is_local && rd->LastRecordEnd() >= max_manifest_read_size_) {
+        break;
+      }
+      if (!rd->ReadRecord(&rec, &sc)) {
+        break;
+      }
+      err_reader = rd;
+      Slice body = rec;
+      uint64_t seq = 0;
+      if (RcMfPrefixed()) {  // v-plainmf: RC_MF_PREFIXED=1 -> 예전 dma3 형식(8바이트 mseq 접두어)
+        if (body.size() >= 8) {
+          seq = DecodeFixed64(body.data());
+          body.remove_prefix(8);
+        }
+      } else {
+        seq = rc_plain_seq++;  // v-plainmf: RocksDB 기본 형식, 파일 안 순서를 그대로 순번으로
+      }
+      VersionEdit edit;
+      s = edit.DecodeFrom(body);
+      if (!s.ok()) {
+        break;
+      }
+      if (is_local) {
+        // 기존과 동일한 의미: 로컬 파일에서 성공적으로 디코딩된 가장
+        // 먼 지점 (apply 성공 여부와 무관, 원본 코드와 동일한 시점에 갱신).
+        last_valid_record_end_ = rd->LastRecordEnd();
+      }
+      pending.push_back(PendingRecord{seq, std::move(edit), is_local});
     }
-    if (s.ok()) {
+  };
+
+  if (s.ok()) {
+    drain(&reader, true);
+  }
+  // gyu modify: v48 여러 리모트 스트림을 전부 drain
+  for (log::Reader* er : extra_readers) {
+    if (!s.ok() || !log_read_status->ok()) {
+      break;
+    }
+    if (er != nullptr) {
+      drain(er, false);
+    }
+  }
+
+  if (s.ok() && log_read_status->ok()) {
+    std::stable_sort(pending.begin(), pending.end(),
+                     [](const PendingRecord& a, const PendingRecord& b) {
+                       return a.seq < b.seq;
+                     });
+
+    // gyu modify: v49 - recovery gap 감지. pending은 이미 seq 오름차순
+    // 정렬돼있고, 정상이라면(크래시 없었다면) seq가 완전히 연속(dense)
+    // 해야 한다 - 모든 edit이 global_manifest_seq_에서 1개씩만 발급받기
+    // 때문이다. 중간에 구멍이 있다는 건 그 seq를 배정받은 큐가 크래시로
+    // 디스크에 못 쓰고 유실됐다는 뜻이다. 이후 edit들이 그 유실된 edit에
+    // 인과적으로 의존할 수 있으므로(예: 없는 파일을 삭제하려는 edit),
+    // 구멍이 발견된 지점부터는 아예 replay하지 않고 마지막 gap-free
+    // 상태에서 멈춘다 (조용한 롤백).
+    bool seq_gap_detected = false;
+    uint64_t expected_next_seq = 0;
+    bool expected_seq_initialized = false;
+
+    for (auto& pr : pending) {
+      if (!s.ok()) {
+        break;
+      }
+      if (seq_gap_detected) {
+        break;
+      }
+      if (!expected_seq_initialized) {
+        expected_next_seq = pr.seq;
+        expected_seq_initialized = true;
+      }
+      if (pr.seq != expected_next_seq) {
+        fprintf(stderr,
+               "[recovery-gap] GAP DETECTED: expected_seq=%llu got_seq=%llu "
+               "src=%s -> replay 중단, 마지막 gap-free 상태로 롤백\n",
+               (unsigned long long)expected_next_seq,
+               (unsigned long long)pr.seq, pr.from_local ? "local" : "remote");
+        seq_gap_detected = true;
+        break;
+      }
+      expected_next_seq = pr.seq + 1;
+
+      if (pr.seq < last_seen_manifest_seq_) {
+        fprintf(stderr,
+               "[manifest_seq] OUT OF ORDER (unexpected after sort)! "
+               "seq=%llu last_seen=%llu\n",
+               (unsigned long long)pr.seq,
+               (unsigned long long)last_seen_manifest_seq_);
+      }
+      static uint64_t g_seq_record_count = 0;
+      g_seq_record_count++;
+      fprintf(stderr, "[manifest_seq] record#%llu seq=%llu src=%s (sorted)\n",
+             (unsigned long long)g_seq_record_count,
+             (unsigned long long)pr.seq, pr.from_local ? "local" : "remote");
+      last_seen_manifest_seq_ = pr.seq;
+
+      s = read_buffer_.AddEdit(&pr.edit);
+      if (!s.ok()) {
+        break;
+      }
+
       ColumnFamilyData* cfd = nullptr;
-      if (edit.IsInAtomicGroup()) {
+      if (pr.edit.IsInAtomicGroup()) {
         if (read_buffer_.IsFull()) {
           s = OnAtomicGroupReplayBegin();
           for (size_t i = 0; s.ok() && i < read_buffer_.replay_buffer().size();
@@ -57,7 +192,7 @@ void VersionEditHandlerBase::Iterate(log::Reader& reader,
           }
         }
       } else {
-        s = ApplyVersionEdit(edit, &cfd);
+        s = ApplyVersionEdit(pr.edit, &cfd);
         if (s.ok()) {
           recovered_edits++;
         }
@@ -76,7 +211,7 @@ void VersionEditHandlerBase::Iterate(log::Reader& reader,
       // wrong with the underlying file. in this case we
       // want to report the filename, so in here we append
       // the filename to the Corruption message
-      assert(reader.file());
+      assert(err_reader->file());
 
       // build a new error message
       std::stringstream message;
@@ -87,7 +222,7 @@ void VersionEditHandlerBase::Iterate(log::Reader& reader,
         message << ' ';
       }
       // append the filename to the corruption message
-      message << " The file " << reader.file()->file_name()
+      message << " The file " << err_reader->file()->file_name()
               << " may be corrupted.";
       // overwrite the status with the extended status
       s = Status(s.code(), s.subcode(), s.severity(), message.str());
@@ -624,7 +759,15 @@ Status VersionEditHandler::ExtractInfoFromVersionEdit(ColumnFamilyData* cfd,
       version_edit_params_.SetPrevLogNumber(edit.GetPrevLogNumber());
     }
     if (edit.HasNextFile()) {
-      version_edit_params_.SetNextFile(edit.GetNextFile());
+      // gyu modify: v49 - N-way 큐에서는 여러 큐가 동시에 각자 다른
+      // 시점의 next_file_number_ 스냅샷을 자기 배치 마지막 edit에
+      // 남기므로, mseq 순서로 replay해도 NextFile 값이 시간순으로
+      // 단조증가한다는 보장이 없다. 그냥 덮어쓰면 나중에 처리된 값이
+      // 더 작을 때 next_file_number_가 실제보다 작게 복원돼서, 이미
+      // 쓰인 파일 번호를 재사용하는 corruption으로 이어진다. 절대
+      // 줄어들지 않도록 max로 갱신한다.
+      version_edit_params_.SetNextFile(
+          std::max(version_edit_params_.GetNextFile(), edit.GetNextFile()));
     }
     if (edit.HasMaxColumnFamily()) {
       version_edit_params_.SetMaxColumnFamily(edit.GetMaxColumnFamily());

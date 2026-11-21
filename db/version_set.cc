@@ -8,10 +8,14 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include "db/version_set.h"
+#include <atomic>  // v-l0min
+#include <cstdlib>  // v-l0min
 
 #include <algorithm>
 #include <array>
 #include <cinttypes>
+#include <chrono>
+#include <thread>
 #include <cstdio>
 #include <list>
 #include <map>
@@ -866,10 +870,33 @@ Version::~Version() {
         auto* sv = cfd_->GetSuperVersion();
         uint32_t path_id = f->fd.GetPathId();
         assert(path_id < cfd_->ioptions().cf_paths.size());
-        vset_->obsolete_files_.emplace_back(
-            f, cfd_->ioptions().cf_paths[path_id].path,
-            sv ? sv->mutable_cf_options.uncache_aggressiveness : 0,
-            cfd_->GetFileMetadataCacheReservationManager());
+        // gyu modify: v49 - obsolete-file deferred deletion. 이 파일을
+        // obsolete로 만든 edit의 mseq(obsoleted_at_mseq_)가 아직 durable
+        // watermark를 못 넘었으면(= 그 edit이 디스크에 확정 안 됐으면)
+        // 바로 지우지 않고 pending_obsolete_files_에 쌓아둔다. 태깅 안 된
+        // 파일(UINT64_MAX, 예: 한 번도 설치 안 된 채 버려진 version의
+        // 신규 파일)은 기존 동작대로 즉시 obsolete_files_로 보낸다.
+        uint64_t watermark = vset_->GetSafePurgeMseqWatermark();
+        bool durable_or_untagged =
+            (f->obsoleted_at_mseq_ == UINT64_MAX) ||
+            (f->obsoleted_at_mseq_ <= watermark);
+        if (durable_or_untagged) {
+          vset_->obsolete_files_.emplace_back(
+              f, cfd_->ioptions().cf_paths[path_id].path,
+              sv ? sv->mutable_cf_options.uncache_aggressiveness : 0,
+              cfd_->GetFileMetadataCacheReservationManager());
+        } else {
+          // gyu modify: v49 debug - pending 검증용 로그
+          fprintf(stderr,
+                 "[obsolete-defer] file=%llu obsoleted_at_mseq=%llu watermark=%llu -> PENDING\n",
+                 (unsigned long long)f->fd.GetNumber(),
+                 (unsigned long long)f->obsoleted_at_mseq_,
+                 (unsigned long long)watermark);
+          vset_->pending_obsolete_files_.emplace_back(
+              f, cfd_->ioptions().cf_paths[path_id].path,
+              sv ? sv->mutable_cf_options.uncache_aggressiveness : 0,
+              cfd_->GetFileMetadataCacheReservationManager());
+        }
       }
     }
   }
@@ -3769,6 +3796,18 @@ bool ShouldChangeFileTemperature(const ImmutableOptions& ioptions,
 }
 }  // anonymous namespace
 
+// v-l0min: L0->L1 최소 파일 수 (RC_L0_MIN_FILES, 기본 0 = 끔)
+static int RcL0MinFiles() {
+  static const int n = [] {
+    const char* e = std::getenv("RC_L0_MIN_FILES");
+    int v = (e != nullptr) ? std::atoi(e) : 0;
+    if (v < 0) v = 0;
+    fprintf(stderr, "[rc] v-l0min: L0->L1 min files=%d\n", v);
+    return v;
+  }();
+  return n;
+}
+
 void VersionStorageInfo::ComputeCompactionScore(
     const ImmutableOptions& immutable_options,
     const MutableCFOptions& mutable_cf_options,
@@ -3956,6 +3995,21 @@ void VersionStorageInfo::ComputeCompactionScore(
       }
     }
     compaction_level_[level] = level;
+    if (level == 0 && compaction_style_ == kCompactionStyleLevel && score >= 1 &&
+        RcL0MinFiles() > 0) {  // v-l0min
+      int rc_n = 0;
+      for (auto* rc_f : files_[0]) {
+        if (!rc_f->being_compacted) rc_n++;
+      }
+      if (rc_n < RcL0MinFiles()) {
+        score = 0.99;
+        static std::atomic<uint64_t> rc_capped{0};
+        if (rc_capped.fetch_add(1) % 200 == 0) {
+          fprintf(stderr, "[rc] v-l0min: L0 score capped (files=%d) n=%llu\n",
+                  rc_n, (unsigned long long)rc_capped.load());
+        }
+      }
+    }
     compaction_score_[level] = score;
   }
 
@@ -5928,7 +5982,46 @@ Status VersionSet::ProcessManifestWrites(
 
   bool skip_manifest_write =
       first_writer.edit_list.front()->IsNoManifestWriteDummy();
+  bool defer_manifest_write = first_writer.edit_list.front()->IsDeferManifestSync();
+  bool take_defer_path = false;
+  if (false && defer_manifest_write) {
+    std::lock_guard<std::mutex> dlk(deferred_manifest_mu_);
+    take_defer_path = pending_deferred_records_.size() < kDeferBacklogLimit;
+    static std::atomic<uint64_t> g_defer_attempts{0};
+    static std::atomic<uint64_t> g_defer_capped{0};
+    uint64_t attempts = g_defer_attempts.fetch_add(1) + 1;
+    if (!take_defer_path) {
+      uint64_t capped = g_defer_capped.fetch_add(1) + 1;
+      if (capped % 20 == 1) {
+        fprintf(stderr,
+                "[timing] defer_backlog_capped=%llu/%llu (%.1f%%) backlog_size=%zu\n",
+                (unsigned long long)capped, (unsigned long long)attempts,
+                100.0 * capped / attempts, pending_deferred_records_.size());
+      }
+    }
+  }
 
+  {
+    static std::atomic<uint64_t> g_round_defer{0};
+    static std::atomic<uint64_t> g_round_real{0};
+    uint64_t rd, rr;
+    if (take_defer_path) {
+      rd = g_round_defer.fetch_add(1) + 1;
+      rr = g_round_real.load();
+    } else {
+      rr = g_round_real.fetch_add(1) + 1;
+      rd = g_round_defer.load();
+    }
+    uint64_t total = rd + rr;
+    if (total % 20 == 1) {
+      fprintf(stderr,
+              "[timing] round_defer=%llu round_real=%llu (%.1f%% defer) leader_defer_eligible=%d\n",
+              (unsigned long long)rd, (unsigned long long)rr,
+              100.0 * rd / total, (int)defer_manifest_write);
+    }
+  }
+
+  auto t_apply_start = std::chrono::steady_clock::now();
   if (first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
     // No group commits for column family add or drop
     LogAndApplyCFHelper(first_writer.edit_list.front(), &max_last_sequence);
@@ -6041,7 +6134,7 @@ Status VersionSet::ProcessManifestWrites(
       if (it == manifest_writers_.cend()) {
         break;
       }
-      if (skip_manifest_write) {
+      if (skip_manifest_write || take_defer_path) {
         // no grouping when skipping manifest write
         break;
       }
@@ -6067,6 +6160,11 @@ Status VersionSet::ProcessManifestWrites(
         return s;
       }
     }
+  }
+  {
+    auto apply_saveto_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t_apply_start).count();
+    fprintf(stderr, "[timing] apply_saveto=%lldms\n", (long long)apply_saveto_ms);
   }
 
 #ifndef NDEBUG
@@ -6103,7 +6201,7 @@ Status VersionSet::ProcessManifestWrites(
         "VersionSet::ProcessManifestWrites:CheckOneAtomicGroup", &tmp);
     k = i;
   }
-  if (skip_manifest_write) {
+  if (skip_manifest_write || take_defer_path) {
     // no grouping when skipping manifest write
     assert(last_writer == &first_writer);
   }
@@ -6111,7 +6209,7 @@ Status VersionSet::ProcessManifestWrites(
 
   uint64_t prev_manifest_file_size = manifest_file_size_;
   assert(pending_manifest_file_number_ == 0);
-  if (!skip_manifest_write &&
+  if (!skip_manifest_write && !take_defer_path &&
       (!descriptor_log_ ||
        prev_manifest_file_size >= tuned_max_manifest_file_size_)) {
     TEST_SYNC_POINT("VersionSet::ProcessManifestWrites:BeforeNewManifest");
@@ -6155,7 +6253,83 @@ Status VersionSet::ProcessManifestWrites(
   std::unique_ptr<log::Writer> new_desc_log_ptr;
   // Save before releasing mu
   uint64_t manifest_preallocation_size = manifest_preallocation_size_;
-  if (skip_manifest_write) {
+
+  // v46: local 쪽도 remote(v40)와 대칭으로 맞춘다. mu를 놓고 디스크에
+  // 쓰기 전에, 여기서 먼저 AppendVersion까지 mu 보호 구간 안에서 끝낸다.
+  // 이렇게 해야 아래 mu->Unlock() 구간(느린 디스크 I/O) 동안 remote
+  // 리더가 끼어들어 커밋해도 서로의 current() 포인터를 상대가 덮어쓰는
+  // lost-update가 발생하지 않는다. CF add/drop 같은 특수 케이스는
+  // 기존 post-write 경로를 그대로 쓴다 (이 레이스와 무관하고 드물다).
+  // v-vref: early install한 Version을 mu 밖에서 쓰는 동안 살려 둔다. 함수 종료(mu 보유) 시 Unref.
+  struct VRefGuard {
+    std::vector<Version*> vs;
+    ~VRefGuard() { for (Version* gv : vs) gv->Unref(); }
+  } early_vref;
+  bool early_installed = false;
+  std::vector<uint64_t> batch_mseqs;
+  if (!skip_manifest_write && !take_defer_path &&
+      !first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
+    constexpr bool update_stats = true;
+    for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
+      versions[i]->PrepareAppend(read_options, update_stats);
+    }
+    // gyu modify: v49 - obsolete-file deferred deletion (1/2, local path).
+    // mseq를 AppendVersion()보다 먼저 배정하고, old version(교체되기 전
+    // cfd->current())의 FileMetaData에 obsoleted_at_mseq_를 태깅한다.
+    // AppendVersion() 내부에서 old->Unref()가 즉시 실행되어 refs==0이면
+    // 그 자리에서 ~Version()이 돌면서 obsolete_files_에 들어가버리므로,
+    // 태깅은 반드시 AppendVersion() 호출 전에 끝나야 한다.
+    batch_mseqs.reserve(batch_edits.size());
+    for (size_t bidx = 0; bidx < batch_edits.size(); bidx++) {
+      batch_mseqs.push_back(
+          global_manifest_seq_.fetch_add(1, std::memory_order_relaxed));
+    }
+    {
+      // gyu modify: v49 - 로컬 큐에 방금 배정된 mseq 최댓값 기록
+      // (durability watermark 계산용, GetSafePurgeMseqWatermark 참고).
+      uint64_t max_assigned =
+          queue_assigned_mseq_[kLocalQueueIdx].load(std::memory_order_relaxed);
+      if (!batch_mseqs.empty() && batch_mseqs.back() > max_assigned) {
+        queue_assigned_mseq_[kLocalQueueIdx].store(batch_mseqs.back(),
+                                                    std::memory_order_release);
+      }
+    }
+    for (size_t bidx = 0; bidx < batch_edits.size(); bidx++) {
+      VersionEdit* tag_e = batch_edits[bidx];
+      if (tag_e->IsColumnFamilyManipulation() ||
+          tag_e->GetDeletedFiles().empty()) {
+        continue;
+      }
+      ColumnFamilyData* tag_cfd =
+          column_family_set_->GetColumnFamily(tag_e->GetColumnFamily());
+      if (tag_cfd == nullptr) continue;
+      Version* old_v = tag_cfd->current();
+      if (old_v == nullptr) continue;
+      VersionStorageInfo* old_storage = old_v->storage_info();
+      for (const auto& df : tag_e->GetDeletedFiles()) {
+        FileMetaData* fmeta = old_storage->GetFileMetaDataByNumber(df.second);
+        // gyu modify: v49 debug - 태깅 검증용 로그
+        fprintf(stderr,
+               "[obsolete-tag][local] file=%llu found=%d mseq=%llu\n",
+               (unsigned long long)df.second, fmeta != nullptr,
+               (unsigned long long)batch_mseqs[bidx]);
+        if (fmeta != nullptr && fmeta->obsoleted_at_mseq_ == UINT64_MAX) {
+          fmeta->obsoleted_at_mseq_ = batch_mseqs[bidx];
+        }
+      }
+    }
+    for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
+      versions[i]->Ref();  // v-vref
+      early_vref.vs.push_back(versions[i]);
+      ColumnFamilyData* cfd_i = versions[i]->cfd_;
+      AppendVersion(cfd_i, versions[i]);
+    }
+    assert(max_last_sequence >= descriptor_last_sequence_);
+    descriptor_last_sequence_ = max_last_sequence;
+    early_installed = true;
+  }
+
+  if (skip_manifest_write || take_defer_path) {
     if (s.ok()) {
       constexpr bool update_stats = true;
       for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
@@ -6163,10 +6337,14 @@ Status VersionSet::ProcessManifestWrites(
         // want to release the DB mutex in this mode of LogAndApply
         versions[i]->PrepareAppend(read_options, update_stats);
       }
+      if (take_defer_path) { std::lock_guard<std::mutex> dlk(deferred_manifest_mu_); for (size_t bidx = 0; bidx < batch_edits.size(); bidx++) { std::string record; batch_edits[bidx]->EncodeTo(&record, batch_edits_ts_sz[bidx]); pending_deferred_records_.push_back(std::move(record)); } static std::atomic<size_t> g_backlog_max_depth{0}; size_t cur_depth = pending_deferred_records_.size(); size_t prev_max = g_backlog_max_depth.load(); while (cur_depth > prev_max && !g_backlog_max_depth.compare_exchange_weak(prev_max, cur_depth)) {} static std::atomic<uint64_t> g_depth_sample{0}; if (g_depth_sample.fetch_add(1) % 20 == 0) { fprintf(stderr, "[timing] backlog_cur=%zu backlog_max=%zu\n", cur_depth, g_backlog_max_depth.load()); } }
     }
   } else {
     FileOptions opt_file_opts = GetFileOptionsForManifestWrite();
     mu->Unlock();
+    auto t_manifest_io_start = std::chrono::steady_clock::now();
+    auto wall_start_ms_local = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
     TEST_SYNC_POINT("VersionSet::LogAndApply:WriteManifestStart");
     TEST_SYNC_POINT_CALLBACK("VersionSet::LogAndApply:WriteManifest", nullptr);
     if (!first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
@@ -6215,7 +6393,8 @@ Status VersionSet::ProcessManifestWrites(
     }
 
     if (s.ok()) {
-      if (!first_writer.edit_list.front()->IsColumnFamilyManipulation()) {
+      if (!first_writer.edit_list.front()->IsColumnFamilyManipulation() &&
+          !early_installed) {
         constexpr bool update_stats = true;
 
         for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
@@ -6227,6 +6406,7 @@ Status VersionSet::ProcessManifestWrites(
 #ifndef NDEBUG
       size_t idx = 0;
 #endif
+      { std::deque<std::string> local_deferred; { std::lock_guard<std::mutex> dlk(deferred_manifest_mu_); local_deferred.swap(pending_deferred_records_); } for (auto& rec : local_deferred) { io_s = raw_desc_log_ptr->AddRecord(write_options, rec); if (!io_s.ok()) { s = io_s; manifest_io_status = io_s; break; } } }
       assert(batch_edits.size() == batch_edits_ts_sz.size());
       for (size_t bidx = 0; bidx < batch_edits.size(); bidx++) {
         auto& e = batch_edits[bidx];
@@ -6237,6 +6417,16 @@ Status VersionSet::ProcessManifestWrites(
           s = Status::Corruption("Unable to encode VersionEdit:" +
                                  e->DebugString(true));
           break;
+        }
+        // v38: 병렬 매니페스트 설계 1단계 — 전역 시퀀스 번호를 8바이트로
+        // 레코드 맨 앞에 붙인다. 나중에 파일이 2개로 쪼개져도 이 번호로
+        // 복구 시 두 파일의 레코드를 실제 발생 순서대로 merge할 수 있다.
+        {
+          uint64_t mseq = early_installed
+                              ? batch_mseqs[bidx]
+                              : global_manifest_seq_.fetch_add(
+                                    1, std::memory_order_relaxed);
+          (void)mseq;  // v-plainmf: mseq는 메모리(watermark)에서만 사용, 레코드는 RocksDB 기본 형식
         }
         TEST_KILL_RANDOM_WITH_WEIGHT("VersionSet::LogAndApply:BeforeAddRecord",
                                      REDUCE_ODDS2);
@@ -6264,6 +6454,7 @@ Status VersionSet::ProcessManifestWrites(
       if (s.ok()) {
         io_s =
             SyncManifest(db_options_, write_options, raw_desc_log_ptr->file());
+        fprintf(stderr, "[timing] manifest_io(write+fsync)=%.3fms wall_start=%lld tid=%zu\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_manifest_io_start).count(), (long long)wall_start_ms_local, (size_t)std::hash<std::thread::id>{}(std::this_thread::get_id()));
         manifest_io_status = io_s;
         TEST_SYNC_POINT_CALLBACK(
             "VersionSet::ProcessManifestWrites:AfterSyncManifest", &io_s);
@@ -6279,6 +6470,19 @@ Status VersionSet::ProcessManifestWrites(
     // new CURRENT file that points to it.
     if (s.ok()) {
       assert(manifest_io_status.ok());
+    }
+    if (s.ok() && !batch_mseqs.empty() &&
+        !queue_permanently_stuck_[kLocalQueueIdx].load(std::memory_order_acquire)) {
+      // gyu modify: v49 - 로컬 큐 durable watermark 갱신. 여기 도달 +
+      // s.ok()라는 건 이 배치의 모든 edit이 디스크에 fsync까지 확인됐다는
+      // 뜻. 단, 이 큐가 영구 stuck 상태면 절대 전진시키지 않는다 (구멍을
+      // 건너뛰지 못하게).
+      uint64_t max_durable =
+          queue_durable_mseq_[kLocalQueueIdx].load(std::memory_order_relaxed);
+      if (batch_mseqs.back() > max_durable) {
+        queue_durable_mseq_[kLocalQueueIdx].store(batch_mseqs.back(),
+                                                   std::memory_order_release);
+      }
     }
     if (s.ok() && new_descriptor_log) {
       io_s = SetCurrentFile(
@@ -6315,6 +6519,9 @@ Status VersionSet::ProcessManifestWrites(
     LogFlush(db_options_->info_log);
     TEST_SYNC_POINT("VersionSet::LogAndApply:WriteManifestDone");
     mu->Lock();
+    // gyu modify: v49 - durable watermark가 방금 전진했을 수 있으니,
+    // mu 재획득 직후 pending_obsolete_files_에서 안전해진 파일을 sweep.
+    SweepPendingObsoleteFiles();
   }
 
   if (s.ok()) {
@@ -6401,14 +6608,18 @@ Status VersionSet::ProcessManifestWrites(
         MarkMinLogNumberToKeep(last_min_log_number_to_keep);
       }
 
-      for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
-        ColumnFamilyData* cfd = versions[i]->cfd_;
-        AppendVersion(cfd, versions[i]);
+      if (!early_installed) {
+        for (int i = 0; i < static_cast<int>(versions.size()); ++i) {
+          ColumnFamilyData* cfd = versions[i]->cfd_;
+          AppendVersion(cfd, versions[i]);
+        }
       }
     }
-    if (!skip_manifest_write) {
-      assert(max_last_sequence >= descriptor_last_sequence_);
-      descriptor_last_sequence_ = max_last_sequence;
+    if (!skip_manifest_write && !take_defer_path) {
+      if (!early_installed) {
+        assert(max_last_sequence >= descriptor_last_sequence_);
+        descriptor_last_sequence_ = max_last_sequence;
+      }
       manifest_file_number_ = pending_manifest_file_number_;
       manifest_file_size_ = new_manifest_file_size;
       prev_log_number_ = first_writer.edit_list.front()->GetPrevLogNumber();
@@ -6421,8 +6632,19 @@ Status VersionSet::ProcessManifestWrites(
     ROCKS_LOG_ERROR(db_options_->info_log,
                     "Error in committing version edit to MANIFEST: %s",
                     version_edits.c_str());
-    for (auto v : versions) {
-      delete v;
+    if (early_installed) {
+      // v46: versions[]는 이미 cfd->current()로 설치돼 살아있는 상태라
+      // 여기서 delete하면 댕글링 포인터가 된다. 메모리 상태가 디스크보다
+      // 앞서가는 상황을 그대로 받아들인다 (v40 remote 경로와 같은
+      // 트레이드오프) -- 롤백하지 않고 로그만 남긴다.
+      ROCKS_LOG_ERROR(db_options_->info_log,
+                      "MANIFEST write failed after in-memory version was "
+                      "already installed (local path); memory/disk state "
+                      "mismatch accepted, not rolled back.");
+    } else {
+      for (auto v : versions) {
+        delete v;
+      }
     }
     // If manifest append failed for whatever reason, the file could be
     // corrupted. So we need to force the next version update to start a
@@ -6529,6 +6751,277 @@ void VersionSet::WakeUpWaitingManifestWriters() {
 
 // 'datas' is grammatically incorrect. We still use this notation to indicate
 // that this variable represents a collection of column_family_data.
+// v39: 병렬 매니페스트 설계 2단계 — 리모트(IsDeferManifestSync) edit
+// 전용 물리 파일(MANIFEST-REMOTE)에 쓰는 경로. 로컬 descriptor_log_와
+// 완전히 독립된 파일이라 서로 mutex로 순서를 안 맞춰도 된다. 대신 모든
+// 레코드에 global_manifest_seq_로 전역 시퀀스 번호를 붙여서, 재시작 시
+// 두 파일을 시퀀스 순서로 merge 재생하면 실제 발생 순서가 복원된다.
+// gyu modify: v48 N-way 매니페스트 큐 — remote_idx로 9개 중 하나를 선택해서
+// 처리한다. 로직 자체는 v40/v46과 동일, manifest_writers_remote_/
+// descriptor_log_remote_/파일명만 remote_idx로 인덱싱하도록 바뀌었다.
+Status VersionSet::ProcessManifestWritesRemote(
+    std::deque<ManifestWriter>& writers, InstrumentedMutex* mu,
+    const ReadOptions& read_options, const WriteOptions& write_options,
+    int remote_idx) {
+  mu->AssertHeld();
+  assert(!writers.empty());
+  ManifestWriter* first_writer = &writers.front();
+  ManifestWriter* last_writer = first_writer;
+
+  assert(!manifest_writers_remote_[remote_idx].empty());
+  assert(manifest_writers_remote_[remote_idx].front() == first_writer);
+
+  ColumnFamilyData* cfd = first_writer->cfd;
+  assert(cfd != nullptr);
+
+  autovector<VersionEdit*> batch_edits;
+  autovector<std::optional<size_t>> batch_edits_ts_sz;
+  Version* version =
+      new Version(cfd, this, file_options_, cfd->GetLatestMutableCFOptions(),
+                  io_tracer_, current_version_number_++);
+  std::unique_ptr<BaseReferencedVersionBuilder> builder_guard(
+      new BaseReferencedVersionBuilder(cfd));
+  VersionBuilder* builder = builder_guard->version_builder();
+
+  SequenceNumber max_last_sequence = descriptor_last_sequence_;
+
+  const Comparator* ucmp = cfd->user_comparator();
+  assert(ucmp);
+  std::optional<size_t> edit_ts_sz = ucmp->timestamp_size();
+
+  auto it = manifest_writers_remote_[remote_idx].cbegin();
+  for (;;) {
+    last_writer = *it;
+    assert(last_writer->cfd == cfd);
+    for (const auto& e : last_writer->edit_list) {
+      Status hs = LogAndApplyHelper(cfd, builder, e, &max_last_sequence, mu);
+      if (!hs.ok()) {
+        delete version;
+        return hs;
+      }
+      batch_edits.push_back(e);
+      batch_edits_ts_sz.push_back(edit_ts_sz);
+    }
+    ++it;
+    if (it == manifest_writers_remote_[remote_idx].cend()) break;
+    if ((*it)->cfd != cfd) break;
+  }
+
+  {
+    Status bs = builder->SaveTo(version->storage_info());
+    if (!bs.ok()) {
+      delete version;
+      return bs;
+    }
+  }
+
+  bool should_set_log_number =
+      first_writer->edit_list.front()->HasLogNumber() &&
+      first_writer->edit_list.front()->GetLogNumber() > cfd->GetLogNumber();
+  uint64_t next_log_number_to_set =
+      should_set_log_number ? first_writer->edit_list.front()->GetLogNumber()
+                            : 0;
+
+  constexpr bool update_stats = true;
+  version->PrepareAppend(read_options, update_stats);
+  if (should_set_log_number) {
+    cfd->SetLogNumber(next_log_number_to_set);
+  }
+
+  // gyu modify: v49 - obsolete-file deferred deletion (2/2, remote path).
+  // local 경로와 동일한 이유로 mseq 배정 + 태깅을 AppendVersion() 호출보다
+  // 먼저 끝낸다. AppendVersion() 내부의 old->Unref()가 그 자리에서
+  // ~Version()을 트리거할 수 있어서, 그 전에 FileMetaData::obsoleted_at_mseq_를
+  // 반드시 세팅해둬야 한다.
+  std::vector<uint64_t> batch_mseqs;
+  batch_mseqs.reserve(batch_edits.size());
+  for (size_t bidx = 0; bidx < batch_edits.size(); bidx++) {
+    batch_mseqs.push_back(
+        global_manifest_seq_.fetch_add(1, std::memory_order_relaxed));
+  }
+  {
+    // gyu modify: v49 - 이 리모트 큐(remote_idx)에 방금 배정된 mseq
+    // 최댓값 기록 (durability watermark 계산용).
+    uint64_t max_assigned =
+        queue_assigned_mseq_[remote_idx].load(std::memory_order_relaxed);
+    if (!batch_mseqs.empty() && batch_mseqs.back() > max_assigned) {
+      queue_assigned_mseq_[remote_idx].store(batch_mseqs.back(),
+                                              std::memory_order_release);
+    }
+  }
+  {
+    Version* old_v = cfd->current();
+    if (old_v != nullptr) {
+      VersionStorageInfo* old_storage = old_v->storage_info();
+      for (size_t bidx = 0; bidx < batch_edits.size(); bidx++) {
+        VersionEdit* tag_e = batch_edits[bidx];
+        if (tag_e->IsColumnFamilyManipulation() ||
+            tag_e->GetDeletedFiles().empty()) {
+          continue;
+        }
+        for (const auto& df : tag_e->GetDeletedFiles()) {
+          FileMetaData* fmeta = old_storage->GetFileMetaDataByNumber(df.second);
+          // gyu modify: v49 debug - 태깅 검증용 로그
+          fprintf(stderr,
+                 "[obsolete-tag][remote] file=%llu found=%d mseq=%llu\n",
+                 (unsigned long long)df.second, fmeta != nullptr,
+                 (unsigned long long)batch_mseqs[bidx]);
+          if (fmeta != nullptr && fmeta->obsoleted_at_mseq_ == UINT64_MAX) {
+            fmeta->obsoleted_at_mseq_ = batch_mseqs[bidx];
+          }
+        }
+      }
+    }
+  }
+
+  // v-vref: early install한 Version을 mu 밖에서 쓰는 동안 살려 둔다. 함수 종료(mu 보유) 시 Unref.
+  struct VRefGuard {
+    std::vector<Version*> vs;
+    ~VRefGuard() { for (Version* gv : vs) gv->Unref(); }
+  } remote_vref;
+  version->Ref();  // v-vref
+  remote_vref.vs.push_back(version);
+  AppendVersion(cfd, version);
+  assert(max_last_sequence >= descriptor_last_sequence_);
+  descriptor_last_sequence_ = max_last_sequence;
+
+  Status s;
+  IOStatus io_s;
+  mu->Unlock();
+  {
+    auto t_manifest_io_start = std::chrono::steady_clock::now();
+    auto wall_start_ms_remote = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    if (!descriptor_log_remote_[remote_idx]) {
+      std::string remote_fname =
+          dbname_ + "/MANIFEST-REMOTE-" + std::to_string(remote_idx);
+      std::unique_ptr<FSWritableFile> rfile;
+      FileOptions ropt = GetFileOptionsForManifestWrite();
+      IOStatus new_io_s =
+          NewWritableFile(fs_.get(), remote_fname, &rfile, ropt);
+      if (new_io_s.ok()) {
+        descriptor_log_remote_[remote_idx] = CreateManifestWriter(
+            std::move(rfile), remote_fname, ropt,
+            manifest_preallocation_size_);
+      } else {
+        s = new_io_s;
+      }
+    }
+
+    // gyu modify: v49 test - 큐0의 딱 한 번의 write를 확정적으로 스킵해서
+    // "디스크에 전혀 안 쓰임" 상황을 재현한다. kill -9는 페이지 캐시가
+    // 살아남아서 진짜 유실을 재현 못 하므로 이 결정적 훅으로 대체한다.
+    static std::atomic<bool> g_test_dropped_queue0_once{false};
+    static const bool kTestDropQueue0Once =
+        (getenv("RDB_TEST_DROP_QUEUE0_ONCE") != nullptr);
+    bool should_drop_this_write = false;
+    if (kTestDropQueue0Once && remote_idx == 0) {
+      bool expected = false;
+      should_drop_this_write =
+          g_test_dropped_queue0_once.compare_exchange_strong(expected, true);
+    }
+    if (should_drop_this_write) {
+      fprintf(stderr,
+             "[test] DROPPING queue0 write (mseq up to %llu) - lost write "
+             "simulation, in-memory state already applied earlier\n",
+             batch_mseqs.empty() ? 0ULL
+                                  : (unsigned long long)batch_mseqs.back());
+      // s는 OK로 둔다 - 호출자(컴팩션 job)는 정상 성공한 것처럼 계속
+      // 진행된다 (실제 크래시라면 그 순간 프로세스가 죽어서 호출자도
+      // 몰랐을 상황과 동일). durable watermark는 아래에서 절대 안 올림.
+    } else if (s.ok()) {
+      log::Writer* raw_desc_log_ptr = descriptor_log_remote_[remote_idx].get();
+      for (size_t bidx = 0; bidx < batch_edits.size(); bidx++) {
+        std::string record;
+        if (!batch_edits[bidx]->EncodeTo(&record, batch_edits_ts_sz[bidx])) {
+          s = Status::Corruption("Unable to encode VersionEdit:" +
+                                 batch_edits[bidx]->DebugString(true));
+          break;
+        }
+        io_s = raw_desc_log_ptr->AddRecord(write_options, record);  // v-plainmf
+        if (!io_s.ok()) {
+          s = io_s;
+          break;
+        }
+      }
+      if (s.ok()) {
+        io_s = SyncManifest(db_options_, write_options,
+                            raw_desc_log_ptr->file());
+        fprintf(stderr, "[timing] manifest_io_remote(write+fsync)=%.3fms wall_start=%lld tid=%zu idx=%d\n",
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - t_manifest_io_start)
+                    .count(), (long long)wall_start_ms_remote, (size_t)std::hash<std::thread::id>{}(std::this_thread::get_id()), remote_idx);
+        if (!io_s.ok()) {
+          s = io_s;
+        }
+      }
+    }
+    if (!s.ok()) {
+      ROCKS_LOG_ERROR(db_options_->info_log, "MANIFEST(remote) write %s\n",
+                      s.ToString().c_str());
+    }
+    if (should_drop_this_write) {
+      // gyu modify: v49 - 이 큐가 write를 놓쳤으니 영구 stuck으로
+      // 표시한다. 앞으로 이 큐가 다시 성공적으로 써도 durable_mseq는
+      // 절대 전진하지 않는다 - 이 구멍 이후로는 아무 파일도 이 큐를
+      // 근거로 안전하다고 판정되지 않는다.
+      queue_permanently_stuck_[remote_idx].store(true, std::memory_order_release);
+    } else if (s.ok() && !batch_mseqs.empty() &&
+               !queue_permanently_stuck_[remote_idx].load(std::memory_order_acquire)) {
+      // gyu modify: v49 - 리모트 큐(remote_idx) durable watermark 갱신.
+      // 여기 도달 + s.ok()라는 건 이 배치가 디스크에 fsync까지
+      // 확인됐다는 뜻.
+      uint64_t max_durable =
+          queue_durable_mseq_[remote_idx].load(std::memory_order_relaxed);
+      if (batch_mseqs.back() > max_durable) {
+        queue_durable_mseq_[remote_idx].store(batch_mseqs.back(),
+                                               std::memory_order_release);
+      }
+    }
+    LogFlush(db_options_->info_log);
+    mu->Lock();
+    // gyu modify: v49 - durable watermark가 방금 전진했을 수 있으니,
+    // mu 재획득 직후 pending_obsolete_files_에서 안전해진 파일을 sweep.
+    SweepPendingObsoleteFiles();
+  }
+
+  if (!s.ok()) {
+    ROCKS_LOG_ERROR(
+        db_options_->info_log,
+        "Error writing version edit to MANIFEST (remote path, memory "
+        "state already applied): %s",
+        s.ToString().c_str());
+  }
+
+  while (true) {
+    ManifestWriter* ready = manifest_writers_remote_[remote_idx].front();
+    manifest_writers_remote_[remote_idx].pop_front();
+    bool need_signal = true;
+    for (const auto& w : writers) {
+      if (&w == ready) {
+        need_signal = false;
+        break;
+      }
+    }
+    ready->status = s;
+    ready->done = true;
+    if (ready->manifest_write_callback) {
+      (ready->manifest_write_callback)(s);
+    }
+    if (need_signal) {
+      ready->cv.Signal();
+    }
+    if (ready == last_writer) {
+      break;
+    }
+  }
+  if (!manifest_writers_remote_[remote_idx].empty()) {
+    manifest_writers_remote_[remote_idx].front()->cv.Signal();
+  }
+  return s;
+}
+
 Status VersionSet::LogAndApply(
     const autovector<ColumnFamilyData*>& column_family_datas,
     const ReadOptions& read_options, const WriteOptions& write_options,
@@ -6561,22 +7054,43 @@ Status VersionSet::LogAndApply(
     assert(edit_lists[0][0]->IsColumnFamilyAdd());
     assert(new_cf_options != nullptr);
   }
+  auto t_enqueue = std::chrono::steady_clock::now();
   std::deque<ManifestWriter> writers;
   if (num_cfds > 0) {
     assert(static_cast<size_t>(num_cfds) == edit_lists.size());
   }
+  // gyu modify: v48 N-way 큐 라우팅 — edit에 붙은 defer_queue_idx_로
+  // 리모트 큐(0~kNumRemoteQueues-1) 중 하나를 고른다.
+  bool route_remote = (num_cfds == 1 && !edit_lists[0].empty() &&
+                       edit_lists[0].front()->IsDeferManifestSync());
+  int remote_idx = 0;
+  if (route_remote) {
+    remote_idx = edit_lists[0].front()->GetDeferQueueIdx();
+    if (remote_idx < 0 || remote_idx >= kNumRemoteQueues) {
+      remote_idx = 0;
+    }
+  }
+  std::deque<ManifestWriter*>& target_queue =
+      route_remote ? manifest_writers_remote_[remote_idx] : manifest_writers_;
   for (int i = 0; i < num_cfds; ++i) {
     const auto wcb =
         manifest_wcbs.empty() ? [](const Status&) {} : manifest_wcbs[i];
     writers.emplace_back(mu, column_family_datas[i], edit_lists[i], wcb);
-    manifest_writers_.push_back(&writers[i]);
+    target_queue.push_back(&writers[i]);
   }
+    fprintf(stderr, "[timing] manifest_writers_depth=%zu route=%s idx=%d\n", target_queue.size(), route_remote ? "remote" : "local", remote_idx);
   assert(!writers.empty());
   ManifestWriter& first_writer = writers.front();
   TEST_SYNC_POINT_CALLBACK("VersionSet::LogAndApply:BeforeWriterWaiting",
                            nullptr);
-  while (!first_writer.done && &first_writer != manifest_writers_.front()) {
+  while (!first_writer.done && &first_writer != target_queue.front()) {
     first_writer.cv.Wait();
+  }
+  {
+    auto queue_wait_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t_enqueue).count();
+    fprintf(stderr, "[timing] queue_wait=%lldms became_leader=%d\n",
+            (long long)queue_wait_ms, first_writer.done ? 0 : 1);
   }
   if (first_writer.done) {
     // All non-CF-manipulation operations can be grouped together and
@@ -6611,15 +7125,19 @@ Status VersionSet::LogAndApply(
     s = pre_cb();
   }
   if (!s.ok()) {
-    // Revert manifest_writers_
+    // Revert target_queue
     for (int i = 0; i != num_cfds; ++i) {
-      manifest_writers_.pop_front();
+      target_queue.pop_front();
     }
     // Notify new head of manifest write queue.
-    if (!manifest_writers_.empty()) {
-      manifest_writers_.front()->cv.Signal();
+    if (!target_queue.empty()) {
+      target_queue.front()->cv.Signal();
     }
     return s;
+  } else if (route_remote) {
+    // gyu modify: v48
+    return ProcessManifestWritesRemote(writers, mu, read_options,
+                                       write_options, remote_idx);
   } else {
     return ProcessManifestWrites(writers, mu, dir_contains_current_file,
                                  new_descriptor_log, new_cf_options,
@@ -6807,6 +7325,33 @@ Status VersionSet::Recover(
   }
   TEST_SYNC_POINT("VersionSet::Recover:StartManifestRead");
 
+  // gyu modify: v48 N-way 매니페스트 확장 — MANIFEST-REMOTE-0 ..
+  // MANIFEST-REMOTE-{kNumRemoteQueues-1} 중 존재하는 파일을 전부 열어서
+  // 시퀀스 번호 기준으로 merge 재생한다.
+  std::vector<std::unique_ptr<SequentialFileReader>> remote_manifest_file_readers;
+  for (int ridx = 0; ridx < kNumRemoteQueues; ridx++) {
+    std::string remote_manifest_path =
+        dbname_ + "/MANIFEST-REMOTE-" + std::to_string(ridx);
+    if (!fs_->FileExists(remote_manifest_path, IOOptions(), nullptr).ok()) {
+      continue;
+    }
+    std::unique_ptr<FSSequentialFile> remote_manifest_file;
+    Status rs = fs_->NewSequentialFile(
+        remote_manifest_path, fs_->OptimizeForManifestRead(file_options_),
+        &remote_manifest_file, nullptr);
+    if (rs.ok()) {
+      remote_manifest_file_readers.push_back(
+          std::unique_ptr<SequentialFileReader>(new SequentialFileReader(
+              std::move(remote_manifest_file), remote_manifest_path,
+              db_options_->log_readahead_size, io_tracer_,
+              db_options_->listeners, /*rate_limiter=*/nullptr, is_retry)));
+    } else {
+      ROCKS_LOG_WARN(db_options_->info_log,
+                     "Found %s but failed to open: %s\n",
+                     remote_manifest_path.c_str(), rs.ToString().c_str());
+    }
+  }
+
   uint64_t current_manifest_file_size = 0;
   uint64_t log_number = 0;
   {
@@ -6815,19 +7360,47 @@ Status VersionSet::Recover(
     reporter.status = &log_read_status;
     log::Reader reader(nullptr, std::move(manifest_file_reader), &reporter,
                        true /* checksum */, 0 /* log_number */);
+
+    VersionSet::LogReporter remote_reporter;
+    remote_reporter.status = &log_read_status;
+    // gyu modify: v48 remote_manifest_file_readers 개수만큼 log::Reader 생성
+    std::vector<std::unique_ptr<log::Reader>> remote_readers;
+    std::vector<log::Reader*> remote_reader_ptrs;
+    for (auto& rmr : remote_manifest_file_readers) {
+      remote_readers.push_back(std::unique_ptr<log::Reader>(new log::Reader(
+          nullptr, std::move(rmr), &remote_reporter, true /* checksum */,
+          0 /* log_number */)));
+      remote_reader_ptrs.push_back(remote_readers.back().get());
+    }
+
     VersionEditHandler handler(
         read_only, column_families, const_cast<VersionSet*>(this),
         /*track_found_and_missing_files=*/false, no_error_if_files_missing,
         io_tracer_, read_options, /*allow_incomplete_valid_version=*/false,
         EpochNumberRequirement::kMightMissing,
         /*skip_load_table_files=*/db_options_->open_files_async);
-    handler.Iterate(reader, &log_read_status);
+    handler.Iterate(reader, &log_read_status, remote_reader_ptrs);
     s = handler.status();
     if (s.ok()) {
       log_number = handler.GetVersionEditParams().GetLogNumber();
       current_manifest_file_size = reader.GetReadOffset();
       assert(current_manifest_file_size != 0);
       handler.GetDbId(db_id);
+    }
+    if (s.ok()) {
+      // gyu modify: v49 - global_manifest_seq_를 복구된 마지막 seq 다음
+      // 값으로 재시딩한다. 안 하면 재시작마다 0부터 다시 시작해서 예전
+      // MANIFEST에 이미 쓰인 seq 번호랑 겹쳐버려, gap 감지가 여러 번의
+      // 재시작에 걸쳐서는 무의미해진다.
+      uint64_t next_seq = handler.GetLastSeenManifestSeq() + 1;
+      uint64_t cur_seq = global_manifest_seq_.load(std::memory_order_relaxed);
+      if (next_seq > cur_seq) {
+        global_manifest_seq_.store(next_seq, std::memory_order_relaxed);
+      }
+      fprintf(stderr,
+             "[recovery-seq] global_manifest_seq_ reseeded to %llu (last_seen=%llu)\n",
+             (unsigned long long)next_seq,
+             (unsigned long long)(next_seq - 1));
     }
     if (s.ok()) {
       RecoverEpochNumbers();
@@ -7337,6 +7910,13 @@ Status VersionSet::WriteCurrentStateToManifest(
   // LogAndApply (the same single thread), so we're safe to iterate.
 
   assert(io_s.ok());
+  // v38: 병렬 매니페스트 설계 1단계 — 이 함수의 모든 AddRecord도
+  // 동일한 전역 시퀀스 번호를 붙이도록 감싼다.
+  auto add_seq_record = [&](const std::string& rec) -> IOStatus {
+    global_manifest_seq_.fetch_add(1, std::memory_order_relaxed);  // v-plainmf
+    return log->AddRecord(write_options, rec);
+  };
+
   if (db_options_->write_dbid_to_manifest) {
     VersionEdit edit_for_db_id;
     assert(!db_id_.empty());
@@ -7346,7 +7926,7 @@ Status VersionSet::WriteCurrentStateToManifest(
       return Status::Corruption("Unable to Encode VersionEdit:" +
                                 edit_for_db_id.DebugString(true));
     }
-    io_s = log->AddRecord(write_options, db_id_record);
+    io_s = add_seq_record(db_id_record);
     if (!io_s.ok()) {
       return io_s;
     }
@@ -7361,7 +7941,7 @@ Status VersionSet::WriteCurrentStateToManifest(
       return Status::Corruption("Unable to Encode VersionEdit: " +
                                 wal_additions.DebugString(true));
     }
-    io_s = log->AddRecord(write_options, record);
+    io_s = add_seq_record(record);
     if (!io_s.ok()) {
       return io_s;
     }
@@ -7378,7 +7958,7 @@ Status VersionSet::WriteCurrentStateToManifest(
     return Status::Corruption("Unable to Encode VersionEdit: " +
                               wal_deletions.DebugString(true));
   }
-  io_s = log->AddRecord(write_options, wal_deletions_record);
+  io_s = add_seq_record(wal_deletions_record);
   if (!io_s.ok()) {
     return io_s;
   }
@@ -7408,7 +7988,7 @@ Status VersionSet::WriteCurrentStateToManifest(
         return Status::Corruption("Unable to Encode VersionEdit:" +
                                   edit.DebugString(true));
       }
-      io_s = log->AddRecord(write_options, record);
+      io_s = add_seq_record(record);
       if (!io_s.ok()) {
         return io_s;
       }
@@ -7490,7 +8070,7 @@ Status VersionSet::WriteCurrentStateToManifest(
         return Status::Corruption("Unable to Encode VersionEdit:" +
                                   edit.DebugString(true));
       }
-      io_s = log->AddRecord(write_options, record);
+      io_s = add_seq_record(record);
       if (!io_s.ok()) {
         return io_s;
       }
@@ -7512,7 +8092,7 @@ Status VersionSet::WriteCurrentStateToManifest(
       return Status::Corruption("Unable to Encode VersionEdit:" +
                                 edit.DebugString(true));
     }
-    io_s = log->AddRecord(write_options, record);
+    io_s = add_seq_record(record);
     if (!io_s.ok()) {
       return io_s;
     }
@@ -8017,7 +8597,7 @@ void VersionSet::GetObsoleteFiles(std::vector<ObsoleteFileInfo>* files,
 
   std::vector<ObsoleteFileInfo> pending_files;
   for (auto& f : obsolete_files_) {
-    if (f.metadata->fd.GetNumber() < min_pending_output) {
+    if (f.metadata == nullptr || f.metadata->fd.GetNumber() < min_pending_output) {
       files->emplace_back(std::move(f));
     } else {
       pending_files.emplace_back(std::move(f));

@@ -27,6 +27,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <mutex>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -1394,6 +1395,13 @@ class VersionSet {
   // Return the current manifest file number
   uint64_t manifest_file_number() const { return manifest_file_number_; }
 
+  // v38: 병렬 매니페스트 설계 1단계 — DBImpl::NewDB()처럼 VersionSet
+  // 바깥에서 직접 MANIFEST에 레코드를 쓰는 코드도 같은 전역 시퀀스
+  // 카운터를 쓸 수 있게 하는 public 접근자.
+  uint64_t NextManifestSeq() {
+    return global_manifest_seq_.fetch_add(1, std::memory_order_relaxed);
+  }
+
   uint64_t options_file_number() const { return options_file_number_; }
 
   uint64_t pending_manifest_file_number() const {
@@ -1806,11 +1814,70 @@ class VersionSet {
   // Opened lazily
   std::unique_ptr<log::Writer> descriptor_log_;
 
+  // v38: 병렬 매니페스트 설계 1단계 — 레코드마다 붙일 전역 시퀀스 번호.
+  // 로컬/리모트 어느 쪽 리더가 쓰든 이 카운터에서 값을 하나씩 뽑아 쓴다.
+  std::atomic<uint64_t> global_manifest_seq_{0};
+
+  // gyu modify: v48 N-way 매니페스트 큐 확장 — edit의 defer_queue_idx_
+  // 기준으로 kNumRemoteQueues개의 독립된 물리 로그(MANIFEST-REMOTE-0 ..
+  // MANIFEST-REMOTE-{N-1})에 분산해서 쓴다.
+  static constexpr int kNumRemoteQueues = 9;
+  std::unique_ptr<log::Writer> descriptor_log_remote_[kNumRemoteQueues];
+  uint64_t manifest_file_number_remote_ = 0;
+  uint64_t pending_manifest_file_number_remote_ = 0;
+  uint64_t manifest_file_size_remote_ = 0;
+  std::deque<ManifestWriter*> manifest_writers_remote_[kNumRemoteQueues];
+
+  // gyu modify: v49 - obsolete-file deferred deletion. 큐별 durability
+  // watermark. 인덱스 0..kNumRemoteQueues-1 은 리모트 큐, 인덱스
+  // kLocalQueueIdx(=kNumRemoteQueues)는 로컬(descriptor_log_) 큐.
+  // queue_assigned_mseq_[q]  : 그 큐에 지금까지 배정된 mseq 중 최댓값
+  // queue_durable_mseq_[q]   : 그 큐가 디스크에 fsync까지 확인한 mseq 중 최댓값
+  // assigned == durable 인 큐는 "밀린 일이 없다"는 뜻이라 전역 워터마크
+  // 계산(MIN)에서 제외한다 — 그래야 지금처럼 리모트 큐가 실전에서 아예
+  // 안 쓰이는 상황에서도 그 큐 때문에 워터마크가 0에 영원히 묶이지 않는다.
+  static constexpr int kLocalQueueIdx = kNumRemoteQueues;
+  static constexpr int kNumManifestQueues = kNumRemoteQueues + 1;
+  std::atomic<uint64_t> queue_assigned_mseq_[kNumManifestQueues] = {};
+  std::atomic<uint64_t> queue_durable_mseq_[kNumManifestQueues] = {};
+
+  // gyu modify: v49 - 큐가 한 번이라도 write를 놓치면(디스크에 실제로
+  // 안 쓰였는데도 호출자에겐 성공으로 보고된 경우) 영구적으로 표시한다.
+  // 이렇게 안 하면, 그 큐가 나중에 다시 정상적으로 write에 성공할 때
+  // durable_mseq가 놓친 mseq를 건너뛰고 확 전진해버려서, 그 구멍
+  // 이후의 진짜 obsolete 판정들이 전부 "안전하다"고 오판될 수 있다.
+  // 한 번 stuck되면 이 프로세스가 끝날 때까지(재시작 전까지) 절대
+  // 안 풀린다 - 보수적으로 "이 지점 이후로는 아무것도 지우지 않는다".
+  std::atomic<bool> queue_permanently_stuck_[kNumManifestQueues] = {};
+
+  // gyu modify: v49 - 모든 활성 큐(assigned != durable, 또는 영구
+  // stuck)의 durable_mseq 중 MIN을 리턴. 활성/stuck 큐가 하나도
+  // 없으면(전부 caught up) UINT64_MAX 리턴 — "지금까지 배정된 건
+  // 다 durable하다, 뭐든 안전하게 지워도 된다"는 뜻.
+  uint64_t GetSafePurgeMseqWatermark() const {
+    uint64_t min_watermark = UINT64_MAX;
+    for (int q = 0; q < kNumManifestQueues; q++) {
+      bool stuck = queue_permanently_stuck_[q].load(std::memory_order_acquire);
+      uint64_t assigned = queue_assigned_mseq_[q].load(std::memory_order_acquire);
+      uint64_t durable = queue_durable_mseq_[q].load(std::memory_order_acquire);
+      if (!stuck && assigned == durable) {
+        continue;
+      }
+      if (durable < min_watermark) {
+        min_watermark = durable;
+      }
+    }
+    return min_watermark;
+  }
+
   // generates a increasing version number for every new version
   uint64_t current_version_number_;
 
   // Queue of writers to the manifest file
   std::deque<ManifestWriter*> manifest_writers_;
+  std::mutex deferred_manifest_mu_;
+  std::deque<std::string> pending_deferred_records_;
+  static constexpr size_t kDeferBacklogLimit = 20;
 
   // Current size of manifest file
   uint64_t manifest_file_size_;
@@ -1848,6 +1915,56 @@ class VersionSet {
   std::vector<ObsoleteBlobFileInfo> obsolete_blob_files_;
   std::vector<std::string> obsolete_manifests_;
 
+  // gyu modify: v49 - obsolete-file deferred deletion. Version::~Version()
+  // 에서 obsolete로 판정된 파일 중, obsoleted_at_mseq_가 아직 durable
+  // watermark를 못 넘은(=obsoleting edit이 디스크에 확정 안 된) 파일은
+  // 여기 임시로 쌓아둔다. watermark가 전진할 때마다
+  // SweepPendingObsoleteFiles()가 obsolete_files_로 옮긴다.
+  std::vector<ObsoleteFileInfo> pending_obsolete_files_;
+
+  // gyu modify: v49 - pending_obsolete_files_ 중 지금 watermark 기준으로
+  // 안전해진(= obsoleted_at_mseq_ <= watermark) 항목을 obsolete_files_로
+  // 옮긴다. 반드시 mu를 잡은 상태에서 호출해야 한다 (obsolete_files_/
+  // pending_obsolete_files_ 는 다른 CF의 Version::~Version()도 동시에
+  // 건드릴 수 있는 VersionSet 공유 상태라서).
+  void SweepPendingObsoleteFiles() {
+    if (pending_obsolete_files_.empty()) return;
+    uint64_t watermark = GetSafePurgeMseqWatermark();
+    std::vector<ObsoleteFileInfo> still_pending;
+    still_pending.reserve(pending_obsolete_files_.size());
+    for (auto& info : pending_obsolete_files_) {
+      bool safe = (info.metadata == nullptr) ||
+                  (info.metadata->obsoleted_at_mseq_ == UINT64_MAX) ||
+                  (info.metadata->obsoleted_at_mseq_ <= watermark);
+      if (safe) {
+        // gyu modify: v49 debug - sweep 검증용 로그
+        fprintf(stderr,
+               "[obsolete-defer] file=%llu obsoleted_at_mseq=%llu watermark=%llu -> SWEPT(promoted)\n",
+               info.metadata ? (unsigned long long)info.metadata->fd.GetNumber() : 0ULL,
+               info.metadata ? (unsigned long long)info.metadata->obsoleted_at_mseq_ : 0ULL,
+               (unsigned long long)watermark);
+        obsolete_files_.push_back(std::move(info));
+      } else {
+        still_pending.push_back(std::move(info));
+      }
+    }
+    pending_obsolete_files_.swap(still_pending);
+  }
+
+  // gyu modify: v49 - expose pending_obsolete_files_ file numbers so the
+  // full-scan backstop (DBImpl::FindObsoleteFiles/PurgeObsoleteFiles) doesn't
+  // physically delete files we've deliberately deferred via obsoleted_at_mseq_.
+  // Without this, the full-scan path compares disk files only against the
+  // CURRENT live version's file list, which doesn't know about our deferred
+  // pending list, and deletes them anyway.
+  void AddPendingObsoleteFileNumbers(std::vector<uint64_t>* live_list) const {
+    for (const auto& info : pending_obsolete_files_) {
+      if (info.metadata != nullptr) {
+        live_list->push_back(info.metadata->fd.GetNumber());
+      }
+    }
+  }
+
   // env options for all reads and writes except compactions
   FileOptions file_options_;
 
@@ -1875,6 +1992,13 @@ class VersionSet {
                                const ColumnFamilyOptions* new_cf_options,
                                const ReadOptions& read_options,
                                const WriteOptions& write_options);
+
+  // gyu modify: v48 리모트 전용 물리 파일에 쓰는 경로 (remote_idx로 N개 중 선택)
+  Status ProcessManifestWritesRemote(std::deque<ManifestWriter>& writers,
+                                     InstrumentedMutex* mu,
+                                     const ReadOptions& read_options,
+                                     const WriteOptions& write_options,
+                                     int remote_idx);
 
   void LogAndApplyCFHelper(VersionEdit* edit,
                            SequenceNumber* max_last_sequence);

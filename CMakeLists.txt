@@ -636,7 +636,7 @@ if(USE_FOLLY)
   if(USE_FOLLY_LITE)
     message(FATAL_ERROR "Please specify one of USE_FOLLY or USE_FOLLY_LITE")
   endif()
-  if(ROCKSDB_BUILD_SHARED)
+  if(ROCKSDB_BUILD_SHARED AND TARGET ${ROCKSDB_SHARED_LIB})
     message(FATAL_ERROR "Cannot build RocksDB shared library with folly")
   endif()
   set(ROCKSDB_BUILD_SHARED OFF)
@@ -708,7 +708,16 @@ if(USE_FOLLY)
   endif()
 endif()
 find_package(Threads REQUIRED)
-
+#gyu add
+set(SISCI_ROOT "/opt/DIS" CACHE PATH "Dolphin SISCI 설치 경로")
+find_library(SISCI_LIB sisci
+  HINTS ${SISCI_ROOT}/lib64 ${SISCI_ROOT}/lib
+  REQUIRED)
+set(SISCI_INCS
+  ${SISCI_ROOT}/include
+  ${SISCI_ROOT}/include/dis
+)
+#gyu end
 # Main library source code
 
 set(SOURCES
@@ -882,6 +891,12 @@ set(SOURCES
         options/options_parser.cc
         port/mmap.cc
         port/stack_trace.cc
+	#gyu add
+	remote_compaction/shared/compaction_spec.cc
+	remote_compaction/shared/ntb_channel.cc
+	remote_compaction/primary_only/compaction_dispatcher.cc
+	remote_compaction/primary_only/remote_compaction_job.cc
+	#gyu end
         table/adaptive/adaptive_table_factory.cc
         table/block_based/binary_search_index_reader.cc
         table/block_based/block.cc
@@ -1258,8 +1273,19 @@ target_include_directories(${ROCKSDB_STATIC_LIB} PUBLIC
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>)
 target_link_libraries(${ROCKSDB_STATIC_LIB} PRIVATE
   ${THIRDPARTY_LIBS} ${SYSTEM_LIBS})
+#gyu add
+target_include_directories(${ROCKSDB_STATIC_LIB} PRIVATE
+  ${SISCI_INCS})
+target_link_libraries(${ROCKSDB_STATIC_LIB} PRIVATE ${SISCI_LIB})
 
-if(ROCKSDB_BUILD_SHARED)
+if(ROCKSDB_BUILD_SHARED AND TARGET ${ROCKSDB_SHARED_LIB})
+  target_include_directories(${ROCKSDB_SHARED_LIB} PRIVATE
+    ${SISCI_INCS})
+  target_link_libraries(${ROCKSDB_SHARED_LIB} PRIVATE ${SISCI_LIB})
+endif()
+#gyu end
+
+if(ROCKSDB_BUILD_SHARED AND TARGET ${ROCKSDB_SHARED_LIB})
   add_library(${ROCKSDB_SHARED_LIB} SHARED ${SOURCES} ${BUILD_VERSION_CC})
   target_include_directories(${ROCKSDB_SHARED_LIB} PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>)
@@ -1360,7 +1386,7 @@ if(NOT WIN32 OR ROCKSDB_INSTALL_ON_WINDOWS)
     INCLUDES DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
   )
 
-  if(ROCKSDB_BUILD_SHARED)
+  if(ROCKSDB_BUILD_SHARED AND TARGET ${ROCKSDB_SHARED_LIB})
     install(
       TARGETS ${ROCKSDB_SHARED_LIB}
       EXPORT RocksDBTargets
@@ -1673,7 +1699,7 @@ if(WITH_TESTS)
 
   if(WIN32)
     # C executables must link to a shared object
-    if(ROCKSDB_BUILD_SHARED)
+    if(ROCKSDB_BUILD_SHARED AND TARGET ${ROCKSDB_SHARED_LIB})
       set(ROCKSDB_LIB_FOR_C ${ROCKSDB_SHARED_LIB})
     else()
       set(ROCKSDB_LIB_FOR_C OFF)
@@ -1773,3 +1799,4 @@ option(WITH_BENCHMARK "build benchmark tests" OFF)
 if(WITH_BENCHMARK)
   add_subdirectory(${PROJECT_SOURCE_DIR}/microbench/)
 endif()
+
