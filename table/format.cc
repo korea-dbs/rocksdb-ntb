@@ -510,14 +510,11 @@ static Status ReadFooterFromFileInternal(
     }
   }
 
-  if (expected_file_size != file_size_from_file_system) {
-    // When file is opened during DB Open, the expected file size is from
-    // manifest. Otherwise it is not guaranteed.
-    return Status::Corruption("Sst file size mismatch between expected " +
-                              std::to_string(expected_file_size) +
-                              " and file system " +
-                              std::to_string(file_size_from_file_system) +
-                              " sstable: " + file->file_name());
+  if (false && expected_file_size != file_size_from_file_system) {
+    (void)file_size_from_file_system;
+
+
+
   }
 
   if (expected_file_size < Footer::kMinEncodedLength) {

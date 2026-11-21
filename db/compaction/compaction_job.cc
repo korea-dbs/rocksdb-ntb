@@ -7,6 +7,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <chrono>  // v-insttime
+#include <cstdio>
 #include "db/compaction/compaction_job.h"
 
 #include <algorithm>
@@ -62,6 +64,8 @@
 #include "util/stop_watch.h"
 
 namespace ROCKSDB_NAMESPACE {
+extern thread_local std::chrono::steady_clock::time_point rcmp_tls_result_tp;  // v-instwait
+extern thread_local bool rcmp_tls_result_set;  // v-instwait
 
 const char* GetCompactionReasonString(CompactionReason compaction_reason) {
   switch (compaction_reason) {
@@ -1191,7 +1195,13 @@ Status CompactionJob::Install(bool* compaction_released) {
                                             internal_stats_);
 
   if (status.ok()) {
+    auto rc_in_t0 = std::chrono::steady_clock::now();  // v-insttime
+    if (rcmp_tls_result_set) {  // v-instwait
+      fprintf(stderr, "[RCMP_IWAIT] job=%d wait_ms=%.3f\n", job_id_, std::chrono::duration<double, std::milli>(rc_in_t0 - rcmp_tls_result_tp).count());
+      rcmp_tls_result_set = false;
+    }
     status = InstallCompactionResults(compaction_released);
+    fprintf(stderr, "[RCMP_INSTALL] job=%d level=%d install_ms=%.3f\n", job_id_, output_level, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - rc_in_t0).count());
   }
   if (!versions_->io_status().ok()) {
     io_status_ = versions_->io_status();

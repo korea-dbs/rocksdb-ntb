@@ -8,6 +8,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <chrono>  // v-insttime
+#include <cstdio>
 #include "db/compaction/compaction_job.h"
 #include "db/compaction/compaction_state.h"
 #include "logging/logging.h"
@@ -17,6 +19,8 @@
 #include "rocksdb/utilities/options_type.h"
 
 namespace ROCKSDB_NAMESPACE {
+thread_local std::chrono::steady_clock::time_point rcmp_tls_result_tp;  // v-instwait
+thread_local bool rcmp_tls_result_set = false;  // v-instwait
 class SubcompactionState;
 
 CompactionServiceJobStatus
@@ -213,6 +217,14 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
       "%s, files: %s",
       compaction->column_family_data()->GetName().c_str(), job_id_,
       compaction_result.output_path.c_str(), output_files_oss.str().c_str());
+  {  // v-wio: worker가 출력 SST를 쓰고 sync한 시간 (report_bg_io_stats=true일 때만 채워짐)
+    uint64_t rc_out_bytes = 0;
+    for (const auto& rc_f : compaction_result.output_files) rc_out_bytes += rc_f.file_size;
+    const auto& rc_st = compaction_result.stats;
+    fprintf(stderr, "[RCMP_WIO] job=%d files=%zu out_mb=%.1f write_ms=%.1f fsync_ms=%.1f range_sync_ms=%.1f prepare_ms=%.1f\n",
+            job_id_, compaction_result.output_files.size(), rc_out_bytes / 1048576.0, rc_st.file_write_nanos / 1e6,
+            rc_st.file_fsync_nanos / 1e6, rc_st.file_range_sync_nanos / 1e6, rc_st.file_prepare_write_nanos / 1e6);
+  }
 
   // Installation Starts
   for (const auto& file : compaction_result.output_files) {
@@ -220,7 +232,10 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
     auto src_file = compaction_result.output_path + "/" + file.file_name;
     auto tgt_file = TableFileName(compaction->immutable_options().cf_paths,
                                   file_num, compaction->output_path_id());
+    auto rc_rn_t0 = std::chrono::steady_clock::now();  // v-insttime
     s = fs_->RenameFile(src_file, tgt_file, IOOptions(), nullptr);
+    fprintf(stderr, "[RCMP_RENAME] job=%d rename_ms=%.3f\n", job_id_, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - rc_rn_t0).count());
+    rcmp_tls_result_tp = std::chrono::steady_clock::now(); rcmp_tls_result_set = true;  // v-instwait
     if (!s.ok()) {
       sub_compact->status = s;
       db_options_.compaction_service->OnInstallation(

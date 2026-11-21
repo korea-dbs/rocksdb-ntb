@@ -1696,9 +1696,17 @@ if(WITH_BENCHMARK_TOOLS)
     tools/simulated_hybrid_file_system.cc
     tools/db_bench.cc
     tools/tool_hooks.cc
-    tools/db_bench_tool.cc)
+    tools/db_bench_tool.cc
+    tools/nfs_compaction_service.cc)
   target_link_libraries(db_bench${ARTIFACT_SUFFIX}
-    ${ROCKSDB_LIB} ${THIRDPARTY_LIBS})
+    ${ROCKSDB_LIB} ${THIRDPARTY_LIBS}
+    pthread
+    sisci
+    )
+  target_include_directories(db_bench${ARTIFACT_SUFFIX} PRIVATE
+	  /opt/DIS/include
+	  /opt/DIS/include/dis
+  )
 
   add_executable(cache_bench${ARTIFACT_SUFFIX}
     cache/cache_bench.cc

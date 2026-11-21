@@ -39,6 +39,7 @@
 #include <thread>
 #include <unordered_map>
 
+#include "tools/nfs_compaction_service.h" //gyu add
 #include "db/db_impl/db_impl.h"
 #include "db/malloc_stats.h"
 #include "db/version_set.h"
@@ -4995,6 +4996,7 @@ class Benchmark {
               "enabling it automatically\n");
     }
     options.skip_stats_update_on_db_open = FLAGS_skip_stats_update_on_db_open;
+    if (const char* rc_e = getenv("RC_NO_FALLOCATE"); rc_e && *rc_e == '1') { options.allow_fallocate = false; fprintf(stderr, "[rc] v-nofalloc: allow_fallocate=false\n"); }  // v-nofalloc
     options.optimize_filters_for_hits = FLAGS_optimize_filters_for_hits;
     options.paranoid_checks = FLAGS_paranoid_checks;
     options.force_consistency_checks = FLAGS_force_consistency_checks;
@@ -5204,6 +5206,7 @@ class Benchmark {
       }
     }
 
+
     if (FLAGS_num_multi_db <= 1) {
       OpenDb(options, hooks, FLAGS_db, &db_);
     } else {
@@ -5251,6 +5254,10 @@ class Benchmark {
 
   void OpenDb(Options options, ToolHooks& hooks, const std::string& db_name,
               DBWithColumnFamilies* db) {
+    //gyu add
+    options.compaction_service =
+	     std::make_shared<rocksdb::NFSCompactionService>(db_name, 3, 64);
+   
     uint64_t open_start = FLAGS_report_open_timing ? FLAGS_env->NowNanos() : 0;
     Status s;
     // Open with column families if necessary.

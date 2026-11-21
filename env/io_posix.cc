@@ -9,7 +9,7 @@
 
 #ifdef ROCKSDB_LIB_IO_POSIX
 #include "env/io_posix.h"
-
+#include <atomic>//gyu add
 #include <fcntl.h>
 
 #include <algorithm>
@@ -47,6 +47,8 @@
 #endif
 
 namespace ROCKSDB_NAMESPACE {
+
+std::atomic<long long> g_total_sst_read_us{0}; //gyu add
 
 std::string IOErrorMsg(const std::string& context,
                        const std::string& file_name) {
