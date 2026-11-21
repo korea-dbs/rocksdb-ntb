@@ -44,6 +44,15 @@ project(rocksdb
   HOMEPAGE_URL https://rocksdb.org/
   LANGUAGES CXX C ASM)
 
+#gyu add
+include_directories(
+  ${PROJECT_SOURCE_DIR}
+  ${PROJECT_SOURCE_DIR}/include
+  /opt/DIS/include
+  /opt/DIS/include/sisci
+  /opt/DIS/include/dis
+)
+
 if(APPLE)
   # On macOS Cmake, when cross-compiling, sometimes CMAKE_SYSTEM_PROCESSOR wrongfully stays
   # the same as CMAKE_HOST_SYSTEM_PROCESSOR regardless the target CPU.
@@ -1696,9 +1705,13 @@ if(WITH_BENCHMARK_TOOLS)
     tools/simulated_hybrid_file_system.cc
     tools/db_bench.cc
     tools/tool_hooks.cc
-    tools/db_bench_tool.cc)
+    tools/db_bench_tool.cc
+    tools/nfs_compaction_service.cc)
   target_link_libraries(db_bench${ARTIFACT_SUFFIX}
-    ${ROCKSDB_LIB} ${THIRDPARTY_LIBS})
+    ${ROCKSDB_LIB} ${THIRDPARTY_LIBS}
+    pthread
+    sisci 
+  )
 
   add_executable(cache_bench${ARTIFACT_SUFFIX}
     cache/cache_bench.cc

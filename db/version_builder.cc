@@ -7,6 +7,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <cstdlib>  // v-skipload
 #include "db/version_builder.h"
 
 #include <algorithm>
@@ -1644,6 +1645,12 @@ class VersionBuilder::Rep {
                            const MutableCFOptions& mutable_cf_options,
                            size_t max_file_size_for_l0_meta_pin,
                            const ReadOptions& read_options) {
+    // v-skipload: OpenAndCompact worker는 table 일괄 선로딩 생략 (입력 파일만 lazy open)
+    static const char* rcmp_skip_env = getenv("RCMP_SKIP_TABLE_PRELOAD");
+    if (rcmp_skip_env != nullptr && rcmp_skip_env[0] == '1') {
+      return Status::OK();
+    }
+
     assert(table_cache_ != nullptr);
     assert(!track_found_and_missing_files_ || valid_version_available_);
 

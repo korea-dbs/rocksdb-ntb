@@ -1,3 +1,7 @@
+#include <cstdio>  // v-wsplit
+#include <cstdlib>  // v-wsplit
+#include <vector>  // v-wsplit
+#include <thread>  // v-wsplit
 //  Copyright (c) Meta Platforms, Inc. and affiliates.
 //
 //  This source code is licensed under both the GPLv2 (found in the
@@ -346,6 +350,30 @@ void CompactionServiceCompactionJob::Prepare(
   if (compaction_input_.has_end) {
     end = compaction_input_.end;
   }
+  // v-wsplit: whole-range job (no begin/end) + max_subcompactions > 1 + big
+  // enough input -> let CompactionJob::Prepare form key-range subcompactions
+  static const uint64_t kWsplitMinBytes = [] {
+    const char* e = std::getenv("RC_WSPLIT_MIN_MB");
+    long v = (e && *e) ? std::atol(e) : 64;
+    if (v < 0) v = 0;
+    return static_cast<uint64_t>(v) << 20;
+  }();
+  Compaction* rc_c = compact_->compaction;
+  static const bool kWsplitL0Only = [] {  // v-wsplit-l0: 1이면 L0 입력 job(L0->L1)만 분할
+    const char* e = std::getenv("RC_WSPLIT_L0ONLY"); bool v = e && *e == '1';
+    std::fprintf(stderr, "[rc] v-wsplit-l0: RC_WSPLIT_L0ONLY=%d\n", v ? 1 : 0); return v; }();
+  if (!begin.has_value() && !end.has_value() && rc_c->max_subcompactions() > 1 &&
+      (!kWsplitL0Only || rc_c->start_level() == 0) &&  // v-wsplit-l0
+      rc_c->CalculateTotalInputSize() >= kWsplitMinBytes) {
+    CompactionJob::Prepare(std::nullopt, compaction_progress,
+                           compaction_progress_writer);
+    std::fprintf(stderr,
+                 "[rc] v-wsplit: out_level=%d input_mb=%.1f subs=%zu\n",
+                 rc_c->output_level(),
+                 rc_c->CalculateTotalInputSize() / 1048576.0,
+                 compact_->sub_compact_states.size());
+    return;
+  }
   CompactionJob::Prepare(std::make_pair(begin, end), compaction_progress,
                          compaction_progress_writer);
 }
@@ -364,11 +392,19 @@ Status CompactionServiceCompactionJob::Run() {
   const uint64_t start_micros = db_options_.clock->NowMicros();
   c->GetOrInitInputTableProperties();
 
-  // Pick the only sub-compaction we should have
-  assert(compact_->sub_compact_states.size() == 1);
+  // v-wsplit: run every subcompaction; 1 subcompaction = original behavior
+  assert(!compact_->sub_compact_states.empty());
   SubcompactionState* sub_compact = compact_->sub_compact_states.data();
-
-  ProcessKeyValueCompaction(sub_compact);
+  {
+    std::vector<std::thread> rc_threads;
+    rc_threads.reserve(compact_->sub_compact_states.size() - 1);
+    for (size_t i = 1; i < compact_->sub_compact_states.size(); i++) {
+      SubcompactionState* rc_sc = &compact_->sub_compact_states[i];
+      rc_threads.emplace_back([this, rc_sc]() { ProcessKeyValueCompaction(rc_sc); });
+    }
+    ProcessKeyValueCompaction(sub_compact);
+    for (auto& t : rc_threads) t.join();
+  }
 
   uint64_t elapsed_micros = db_options_.clock->NowMicros() - start_micros;
   internal_stats_.SetMicros(elapsed_micros);
@@ -379,8 +415,13 @@ Status CompactionServiceCompactionJob::Run() {
   RecordTimeToHistogram(stats_, COMPACTION_CPU_TIME,
                         internal_stats_.output_level_stats.cpu_micros);
 
+  // v-wsplit: first error among all subcompactions
   Status status = sub_compact->status;
   IOStatus io_s = sub_compact->io_status;
+  for (auto& rc_sc : compact_->sub_compact_states) {
+    if (status.ok() && !rc_sc.status.ok()) status = rc_sc.status;
+    if (io_s.ok() && !rc_sc.io_status.ok()) io_s = rc_sc.io_status;
+  }
 
   if (io_status_.ok()) {
     io_status_ = io_s;
@@ -435,7 +476,8 @@ Status CompactionServiceCompactionJob::Run() {
   compaction_result_->output_level = compact_->compaction->output_level();
   compaction_result_->output_path = output_path_;
   if (status.ok()) {
-    for (const auto& output_file : sub_compact->GetOutputs()) {
+    for (auto& rc_sc : compact_->sub_compact_states)  // v-wsplit: outputs of all subs, in key order
+    for (const auto& output_file : rc_sc.GetOutputs()) {
       auto& meta = output_file.meta;
       compaction_result_->output_files.emplace_back(
           MakeTableFileName(meta.fd.GetNumber()), meta.fd.GetFileSize(),

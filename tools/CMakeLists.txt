@@ -1,30 +1,82 @@
+cmake_minimum_required(VERSION 3.10)
+
+##########################################################
+# 🔥 C++20
+##########################################################
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+##########################################################
+# 🔥 include (여기가 핵심🔥)
+##########################################################
+include_directories(
+  ${PROJECT_SOURCE_DIR}/../include
+  /opt/DIS/include
+  /opt/DIS/include/sisci
+)
+
+##########################################################
+# 🔥 lib 경로
+##########################################################
+link_directories(/opt/DIS/lib64)
+link_directories(/opt/DIS/lib)
+
+##########################################################
+# Core tools
+##########################################################
 set(CORE_TOOLS
   sst_dump.cc
-  ldb.cc)
+  ldb.cc
+)
+
 foreach(src ${CORE_TOOLS})
   get_filename_component(exename ${src} NAME_WE)
-  add_executable(${exename}${ARTIFACT_SUFFIX}
-    ${src})
-  target_link_libraries(${exename}${ARTIFACT_SUFFIX} ${ROCKSDB_LIB})
-  list(APPEND core_tool_deps ${exename})
+
+  add_executable(${exename}
+    ${src}
+  )
+
+  target_link_libraries(${exename}
+    rocksdb
+  )
 endforeach()
 
+##########################################################
+# Optional tools
+##########################################################
 if(WITH_TOOLS)
+
   set(TOOLS
     db_sanity_test.cc
     write_stress.cc
     db_repl_stress.cc
     dump/rocksdb_dump.cc
-    dump/rocksdb_undump.cc)
+    dump/rocksdb_undump.cc
+  )
+
   foreach(src ${TOOLS})
     get_filename_component(exename ${src} NAME_WE)
-    add_executable(${exename}${ARTIFACT_SUFFIX}
-      ${src})
-    target_link_libraries(${exename}${ARTIFACT_SUFFIX} ${ROCKSDB_LIB} ${THIRDPARTY_LIBS})
-    list(APPEND tool_deps ${exename})
+
+    add_executable(${exename}
+      ${src}
+    )
+
+    target_link_libraries(${exename}
+      rocksdb
+    )
   endforeach()
 
-  add_custom_target(ldb_tests
-    COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/ldb_tests.py
-    DEPENDS ldb)
+  ##########################################################
+  # 🔥 NTB worker
+  ##########################################################
+  add_executable(nfs_compaction_worker
+    nfs_compaction_worker.cc
+  )
+
+  target_link_libraries(nfs_compaction_worker
+    rocksdb
+    pthread
+    sisci
+  )
+
 endif()

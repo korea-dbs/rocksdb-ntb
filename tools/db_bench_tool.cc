@@ -16,7 +16,7 @@
 #endif
 #include <fcntl.h>
 #include <sys/types.h>
-
+#include <signal.h> //gyu add
 #include <cstdio>
 #include <cstdlib>
 #ifdef __APPLE__
@@ -39,6 +39,7 @@
 #include <thread>
 #include <unordered_map>
 
+#include "tools/nfs_compaction_service.h" //gyu add
 #include "db/db_impl/db_impl.h"
 #include "db/malloc_stats.h"
 #include "db/version_set.h"
@@ -1967,7 +1968,15 @@ DEFINE_bool(openandcompact_test_cancel_on_odd, false,
 DEFINE_uint32(openandcompact_cancel_after_millseconds, 1,
               "Time to wait before cancelling compaction in odd runs when "
               "openandcompact_test_cancel_on_odd is true");
+//gyu add
+namespace rocksdb {
+  void SignalHandler(int sig) {
+	  std::cout << "[SignalHandler] caught signal: " << sig << std::endl;
+	  exit(0);
+  }
 
+}
+//gyu end
 namespace ROCKSDB_NAMESPACE {
 namespace {
 static Status CreateMemTableRepFactory(
@@ -3475,6 +3484,9 @@ class Benchmark {
     if (!FLAGS_use_existing_db) {
       Options options;
       options.env = FLAGS_env;
+      //gyu add
+     // options.IncreaseParallelism(10);
+     // options.max_subcompactions = 10;
       if (!FLAGS_wal_dir.empty()) {
         options.wal_dir = FLAGS_wal_dir;
       }
@@ -5204,6 +5216,7 @@ class Benchmark {
       }
     }
 
+
     if (FLAGS_num_multi_db <= 1) {
       OpenDb(options, hooks, FLAGS_db, &db_);
     } else {
@@ -5251,6 +5264,9 @@ class Benchmark {
 
   void OpenDb(Options options, ToolHooks& hooks, const std::string& db_name,
               DBWithColumnFamilies* db) {
+    //gyu add
+    auto svc = std::make_shared<rocksdb::NFSCompactionService>("10.10.0.3", 9900, 9901);
+    options.compaction_service = svc;
     uint64_t open_start = FLAGS_report_open_timing ? FLAGS_env->NowNanos() : 0;
     Status s;
     // Open with column families if necessary.
