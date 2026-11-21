@@ -4995,6 +4995,7 @@ class Benchmark {
               "enabling it automatically\n");
     }
     options.skip_stats_update_on_db_open = FLAGS_skip_stats_update_on_db_open;
+    if (const char* rc_e = getenv("RC_NO_FALLOCATE"); rc_e && *rc_e == '1') { options.allow_fallocate = false; fprintf(stderr, "[rc] v-nofalloc: allow_fallocate=false\n"); }  // v-nofalloc
     options.optimize_filters_for_hits = FLAGS_optimize_filters_for_hits;
     options.paranoid_checks = FLAGS_paranoid_checks;
     options.force_consistency_checks = FLAGS_force_consistency_checks;

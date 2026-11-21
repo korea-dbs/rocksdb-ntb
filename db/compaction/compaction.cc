@@ -7,6 +7,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <cstdlib>  // v-subany
+#include <cstdio>  // v-subany
 #include "db/compaction/compaction.h"
 
 #include <cinttypes>
@@ -934,6 +936,18 @@ bool Compaction::ShouldFormSubcompactions() const {
   }
 
   if (cfd_->ioptions().compaction_style == kCompactionStyleLevel) {
+    // v-subany: RC_SUB_MIN_MB>0 이면 레벨과 관계없이 입력 합이 그 이상인 잡도 서브컴팩션 (0=순정 규칙)
+    static const uint64_t kSubAnyMinBytes = [] {
+      const char* e = std::getenv("RC_SUB_MIN_MB");
+      long v = (e && *e) ? std::atol(e) : 0;
+      if (v < 0) v = 0;
+      std::fprintf(stderr, "[rc] v-subany: RC_SUB_MIN_MB=%ld (0=off)\n", v);
+      return static_cast<uint64_t>(v) << 20;
+    }();
+    if (kSubAnyMinBytes > 0 && output_level_ > 0 &&
+        CalculateTotalInputSize() >= kSubAnyMinBytes) {
+      return true;
+    }
     return (start_level_ == 0 || is_manual_compaction_) && output_level_ > 0;
   } else if (cfd_->ioptions().compaction_style == kCompactionStyleUniversal) {
     return number_levels_ > 1 && output_level_ > 0;
