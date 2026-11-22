@@ -1773,3 +1773,17 @@ option(WITH_BENCHMARK "build benchmark tests" OFF)
 if(WITH_BENCHMARK)
   add_subdirectory(${PROJECT_SOURCE_DIR}/microbench/)
 endif()
+
+# NTB-Native remote compaction: worker process.
+set(SISCI_ROOT "/opt/DIS" CACHE PATH "Dolphin SISCI install prefix")
+find_library(SISCI_LIB sisci HINTS ${SISCI_ROOT}/lib64 ${SISCI_ROOT}/lib REQUIRED)
+add_executable(worker_main
+  remote_compaction/shared/compaction_spec.cc
+  remote_compaction/shared/ntb_channel.cc
+  remote_compaction/worker_only/worker_server.cc
+  remote_compaction/worker_only/worker_main.cc)
+target_include_directories(worker_main PRIVATE
+  ${PROJECT_SOURCE_DIR}
+  ${SISCI_ROOT}/include
+  ${SISCI_ROOT}/include/dis)
+target_link_libraries(worker_main PRIVATE ${ROCKSDB_STATIC_LIB} ${SISCI_LIB})

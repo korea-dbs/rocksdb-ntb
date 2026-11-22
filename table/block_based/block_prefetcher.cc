@@ -63,10 +63,14 @@ void BlockPrefetcher::PrefetchIfNeeded(
     // implicit_auto_readahead is set.
     readahead_params.initial_readahead_size = compaction_readahead_size_;
     readahead_params.max_readahead_size = compaction_readahead_size_;
-    rep->CreateFilePrefetchBufferIfNotExists(
-        readahead_params, &prefetch_buffer_,
-        /*readaheadsize_cb=*/nullptr,
-        /*usage=*/FilePrefetchBufferUsage::kCompactionPrefetch);
+    // No prefetch buffer without readahead (the NTB-Native worker reads
+    // its inputs from memory with compaction_readahead_size 0).
+    if (compaction_readahead_size_ > 0) {
+      rep->CreateFilePrefetchBufferIfNotExists(
+          readahead_params, &prefetch_buffer_,
+          /*readaheadsize_cb=*/nullptr,
+          /*usage=*/FilePrefetchBufferUsage::kCompactionPrefetch);
+    }
     return;
   }
 
