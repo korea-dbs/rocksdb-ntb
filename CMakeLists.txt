@@ -709,6 +709,11 @@ if(USE_FOLLY)
 endif()
 find_package(Threads REQUIRED)
 
+# Remote compaction over NTB: Dolphin SISCI (eXpressWare).
+set(SISCI_ROOT "/opt/DIS" CACHE PATH "Dolphin SISCI install prefix")
+find_library(SISCI_LIB sisci HINTS ${SISCI_ROOT}/lib64 ${SISCI_ROOT}/lib REQUIRED)
+set(SISCI_INCS ${SISCI_ROOT}/include ${SISCI_ROOT}/include/dis)
+
 # Main library source code
 
 set(SOURCES
@@ -882,6 +887,10 @@ set(SOURCES
         options/options_parser.cc
         port/mmap.cc
         port/stack_trace.cc
+        remote_compaction/shared/compaction_spec.cc
+        remote_compaction/shared/ntb_channel.cc
+        remote_compaction/primary_only/compaction_dispatcher.cc
+        remote_compaction/primary_only/remote_compaction_job.cc
         table/adaptive/adaptive_table_factory.cc
         table/block_based/binary_search_index_reader.cc
         table/block_based/block.cc
@@ -1258,6 +1267,8 @@ target_include_directories(${ROCKSDB_STATIC_LIB} PUBLIC
   $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>)
 target_link_libraries(${ROCKSDB_STATIC_LIB} PRIVATE
   ${THIRDPARTY_LIBS} ${SYSTEM_LIBS})
+target_include_directories(${ROCKSDB_STATIC_LIB} PRIVATE ${SISCI_INCS})
+target_link_libraries(${ROCKSDB_STATIC_LIB} PUBLIC ${SISCI_LIB})
 
 if(ROCKSDB_BUILD_SHARED)
   add_library(${ROCKSDB_SHARED_LIB} SHARED ${SOURCES} ${BUILD_VERSION_CC})
@@ -1265,6 +1276,8 @@ if(ROCKSDB_BUILD_SHARED)
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>)
   target_link_libraries(${ROCKSDB_SHARED_LIB} PRIVATE
     ${THIRDPARTY_LIBS} ${SYSTEM_LIBS})
+  target_include_directories(${ROCKSDB_SHARED_LIB} PRIVATE ${SISCI_INCS})
+  target_link_libraries(${ROCKSDB_SHARED_LIB} PUBLIC ${SISCI_LIB})
 
   if(WIN32)
     set_target_properties(${ROCKSDB_SHARED_LIB} PROPERTIES

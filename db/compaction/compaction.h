@@ -378,8 +378,22 @@ class Compaction {
   }
 
   Slice GetSmallestUserKey() const { return smallest_user_key_; }
-
   Slice GetLargestUserKey() const { return largest_user_key_; }
+
+  // Key range of the outputs of an in-flight remote compaction. Registered
+  // while the compaction is picked so that RangeOverlapWithCompaction treats
+  // it as busy until it is installed.
+  bool HasOutputRange() const { return has_output_range_; }
+  Slice GetOutputSmallestUserKey() const { return output_smallest_user_key_; }
+  Slice GetOutputLargestUserKey() const { return output_largest_user_key_; }
+
+  void SetOutputRange(const std::string& smallest, const std::string& largest) {
+    output_smallest_user_key_buf_ = smallest;
+    output_largest_user_key_buf_  = largest;
+    output_smallest_user_key_     = Slice(output_smallest_user_key_buf_);
+    output_largest_user_key_      = Slice(output_largest_user_key_buf_);
+    has_output_range_             = true;
+  }
 
   ProximalOutputRangeType GetProximalOutputRangeType() const {
     return proximal_output_range_type_;
@@ -630,6 +644,13 @@ class Compaction {
   // largest user keys in compaction
   // includes timestamp if user-defined timestamp is enabled.
   Slice largest_user_key_;
+
+  // Set by SetOutputRange() (remote compaction only).
+  std::string output_smallest_user_key_buf_;
+  std::string output_largest_user_key_buf_;
+  Slice output_smallest_user_key_;
+  Slice output_largest_user_key_;
+  bool has_output_range_ = false;
 
   // Reason for compaction
   CompactionReason compaction_reason_;

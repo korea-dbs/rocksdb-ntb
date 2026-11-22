@@ -203,6 +203,15 @@ class DBImpl : public DB {
   DBImpl(const DBImpl&) = delete;
   void operator=(const DBImpl&) = delete;
 
+  // Used by RemoteCompactionJob to protect its file numbers from purging.
+  std::list<uint64_t>::iterator CaptureCurrentFileNumberInPendingOutputsForRemote() {
+    return CaptureCurrentFileNumberInPendingOutputs();
+  }
+  void ReleaseFileNumberFromPendingOutputsForRemote(
+      std::unique_ptr<std::list<uint64_t>::iterator> v) {
+    ReleaseFileNumberFromPendingOutputs(v);
+  }
+
   virtual ~DBImpl();
 
   // ---- Implementations of the DB interface ----
@@ -2669,7 +2678,10 @@ class DBImpl : public DB {
   Status BackgroundCompaction(bool* madeProgress, JobContext* job_context,
                               LogBuffer* log_buffer,
                               PrepickedCompaction* prepicked_compaction,
-                              Env::Priority thread_pri);
+                              Env::Priority thread_pri,
+                              // Runs once the compaction is finished; for an
+                              // offloaded compaction that is after install.
+                              std::function<void()> on_async_done = nullptr);
   Status BackgroundFlush(bool* madeProgress, JobContext* job_context,
                          LogBuffer* log_buffer, FlushReason* reason,
                          bool* flush_rescheduled_to_retain_udt,

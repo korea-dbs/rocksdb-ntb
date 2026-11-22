@@ -895,6 +895,9 @@ DEFINE_bool(finish_after_writes, false,
 
 DEFINE_bool(sync, false, "Sync all writes to disk");
 
+DEFINE_bool(allow_fallocate, true,
+            "Options.allow_fallocate. The paper runs use false.");
+
 DEFINE_bool(use_fsync, false, "If true, issue fsync instead of fdatasync");
 
 DEFINE_bool(disable_wal, false, "If true, do not write WAL for write.");
@@ -4586,6 +4589,7 @@ class Benchmark {
     options.log_readahead_size = FLAGS_log_readahead_size;
     options.writable_file_max_buffer_size = FLAGS_writable_file_max_buffer_size;
     options.use_fsync = FLAGS_use_fsync;
+    options.allow_fallocate = FLAGS_allow_fallocate;
     options.num_levels = FLAGS_num_levels;
     options.target_file_size_base = FLAGS_target_file_size_base;
     options.target_file_size_multiplier = FLAGS_target_file_size_multiplier;

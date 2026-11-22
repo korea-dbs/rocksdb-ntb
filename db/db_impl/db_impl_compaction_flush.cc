@@ -9,6 +9,11 @@
 #include <cinttypes>
 #include <deque>
 #include <unordered_map>
+#include <atomic>
+#include <mutex>
+
+#include "remote_compaction/primary_only/compaction_dispatcher.h"
+#include "remote_compaction/primary_only/remote_compaction_job.h"
 
 #include "db/blob/blob_file_partition_manager.h"
 #include "db/builder.h"
@@ -34,6 +39,106 @@
 #include "util/udt_util.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+// ---------------------------------------------------------------------------
+// Remote compaction (NTB-Native)
+//
+// Compactions that write to L1 (from L0), L2 (from L1) or any level >= 3 are
+// offloaded to the worker; everything else runs locally. Offloading can be
+// turned off with RC_REMOTE=0 (same binary, local compaction only).
+// RC_WORKER_NODE sets the worker's NTB node id (default 4).
+// ---------------------------------------------------------------------------
+namespace {
+
+std::once_flag g_rc_init_flag;
+std::unique_ptr<CompactionDispatcher> g_rc_dispatcher;
+
+constexpr int kRouteStatLevels = 8;
+std::atomic<uint64_t> g_route_remote_count[kRouteStatLevels] = {};
+
+void RecordRemoteJob(int level) {
+  const int idx =
+      (level >= 0 && level < kRouteStatLevels) ? level : (kRouteStatLevels - 1);
+  g_route_remote_count[idx].fetch_add(1, std::memory_order_relaxed);
+}
+
+int EnvInt(const char* name, int def) {
+  const char* e = getenv(name);
+  return (e != nullptr && *e != '\0') ? atoi(e) : def;
+}
+
+bool RcRemoteEnabled() {
+  static const bool on = EnvInt("RC_REMOTE", 1) != 0;
+  return on;
+}
+
+// Must give the same answer every time it is asked about the same compaction:
+// BackgroundCompaction skips Prepare() for compactions it will offload.
+bool RcLevelRoute(const Compaction* c) {
+  if (c == nullptr) return false;
+  const int ol = c->output_level();
+  if (ol >= 3) return true;
+  if (ol == 1) return c->start_level() == 0;
+  if (ol == 2) return c->start_level() == 1;
+  return false;
+}
+
+// The worker handles neither range deletions nor merge operators; such
+// compactions always run locally.
+bool RcRemoteSafe(const Compaction* c) {
+  if (c == nullptr) return false;
+  if (c->immutable_options().merge_operator != nullptr) {
+    fprintf(stderr, "[rc] route: local (merge_operator set) output_level=%d\n",
+            c->output_level());
+    return false;
+  }
+  for (size_t li = 0; li < c->num_input_levels(); li++) {
+    for (const FileMetaData* f : *c->inputs(li)) {
+      if (f->num_range_deletions > 0) {
+        fprintf(stderr,
+                "[rc] route: local (file=%llu range_dels=%llu) output_level=%d\n",
+                (unsigned long long)f->fd.GetNumber(),
+                (unsigned long long)f->num_range_deletions, c->output_level());
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+bool ShouldOffload(CompactionDispatcher* disp, const Compaction* c) {
+  return disp != nullptr && RcLevelRoute(c) && RcRemoteSafe(c);
+}
+
+// Connects to the worker on first use. Returns nullptr when offloading is
+// disabled or the connection failed.
+CompactionDispatcher* GetRemoteDispatcher(const std::string& db_path) {
+  if (!RcRemoteEnabled()) return nullptr;
+  std::call_once(g_rc_init_flag, [&]() {
+    DispatchOptions opts;
+    opts.worker_node_id = static_cast<uint32_t>(EnvInt("RC_WORKER_NODE", 4));
+    opts.db_path = db_path;
+    opts.target_file_size = 64ULL * 1024 * 1024;
+    g_rc_dispatcher = std::make_unique<CompactionDispatcher>(opts);
+    Status s = g_rc_dispatcher->Connect();
+    if (!s.ok()) {
+      fprintf(stderr, "[rc] connect failed: %s\n", s.ToString().c_str());
+      g_rc_dispatcher.reset();
+    }
+  });
+  return g_rc_dispatcher.get();
+}
+
+}  // namespace
+
+void DrainRemoteDispatcher() {
+  if (g_rc_dispatcher) g_rc_dispatcher.reset();
+  fprintf(stderr, "[route_summary] per-level remote job counts:\n");
+  for (int lvl = 0; lvl < kRouteStatLevels; lvl++) {
+    const uint64_t n = g_route_remote_count[lvl].load(std::memory_order_relaxed);
+    if (n > 0) fprintf(stderr, "  L%d: remote=%llu\n", lvl, (unsigned long long)n);
+  }
+}
 
 bool DBImpl::EnoughRoomForCompaction(
     ColumnFamilyData* cfd, const std::vector<CompactionInputFiles>& inputs,
@@ -1825,8 +1930,54 @@ Status DBImpl::CompactFilesImpl(
   mutex_.Unlock();
   TEST_SYNC_POINT("CompactFilesImpl:0");
   TEST_SYNC_POINT("CompactFilesImpl:1");
-  // Ignore the status here, as it will be checked in the Install down below...
-  compaction_job.Run().PermitUncheckedError();
+  bool remote_done = false;
+  auto* rc_disp = GetRemoteDispatcher(dbname_);
+  if (c != nullptr && ShouldOffload(rc_disp, c.get())) {
+    auto rc_job = std::make_shared<RemoteCompactionJob>(
+        this, c.get(), c->column_family_data(), rc_disp, directories_.GetDbDir());
+    std::vector<SequenceNumber> snap_seqs;
+    SequenceNumber ewc_snap = kMaxSequenceNumber;
+    {
+      // snapshots_ is guarded by mutex_, which is not held here.
+      InstrumentedMutexLock snap_lk(&mutex_);
+      snap_seqs = snapshots_.GetAll(&ewc_snap);
+    }
+    const int output_level = c->output_level();
+    // The Compaction is shared with the remote job. If the submit fails, `c`
+    // keeps ownership and the compaction runs locally.
+    auto c_own = std::make_shared<std::atomic<bool>>(true);
+    auto c_shared = std::shared_ptr<Compaction>(
+        c.get(), [c_own](Compaction* p) {
+          if (c_own->load()) delete p;
+        });
+    auto* cfd_ptr = c_shared->column_family_data();
+    Status rc_s = rc_job->RunAsync(
+        snap_seqs, ewc_snap, 0, c_shared,
+        [this, c_shared, cfd_ptr, c_own](Status st) mutable {
+          SuperVersionContext sv_ctx(true);
+          InstrumentedMutexLock l(&mutex_);
+          c_shared->ReleaseCompactionFiles(st);
+          InstallSuperVersionAndScheduleWork(cfd_ptr, &sv_ctx);
+          // ~Compaction unrefs Version/cfd, so free it under mutex_.
+          if (c_own->exchange(false)) delete c_shared.get();
+          c_shared.reset();
+          sv_ctx.Clean();
+        });
+    if (rc_s.ok()) {
+      remote_done = true;
+      (void)c.release();  // owned by c_shared from now on
+      RecordRemoteJob(output_level);
+    } else {
+      fprintf(stderr, "[rc] async submit failed, fallback local: %s\n",
+              rc_s.ToString().c_str());
+      c_own->store(false);
+    }
+  }
+  if (!remote_done) {
+    // Ignore the status here, as it will be checked in the Install down below...
+    compaction_job.Run().PermitUncheckedError();
+  }
+
   TEST_SYNC_POINT("CompactFilesImpl:2");
   TEST_SYNC_POINT("CompactFilesImpl:3");
   mutex_.Lock();
@@ -1836,14 +1987,21 @@ Status DBImpl::CompactFilesImpl(
   }
 
   bool compaction_released = false;
-  Status status = compaction_job.Install(&compaction_released);
-  if (!compaction_released) {
-    c->ReleaseCompactionFiles(s);
-  }
-  if (status.ok()) {
-    assert(compaction_job.io_status().ok());
-    InstallSuperVersionAndScheduleWork(
-        c->column_family_data(), job_context->superversion_contexts.data());
+  Status status;
+  if (remote_done) {
+    // Installed by the remote job's completion callback.
+    compaction_job.CleanupCompaction();
+    compaction_released = true;
+  } else {
+    status = compaction_job.Install(&compaction_released);
+    if (!compaction_released) {
+      c->ReleaseCompactionFiles(s);
+    }
+    if (status.ok()) {
+      assert(compaction_job.io_status().ok());
+      InstallSuperVersionAndScheduleWork(
+          c->column_family_data(), job_context->superversion_contexts.data());
+    }
   }
   // status above captures any error during compaction_job.Install, so its ok
   // not check compaction_job.io_status() explicitly if we're not calling
@@ -1853,7 +2011,7 @@ Status DBImpl::CompactFilesImpl(
   auto sfm = static_cast<SstFileManagerImpl*>(
       immutable_db_options_.sst_file_manager.get());
   if (sfm && sfm_reserved_compact_space) {
-    sfm->OnCompactionCompletion(c.get());
+    if (!remote_done) sfm->OnCompactionCompletion(c.get());
   }
 
   ReleaseFileNumberFromPendingOutputs(pending_outputs_inserted_elem);
@@ -3896,6 +4054,8 @@ void DBImpl::BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
   LogBuffer log_buffer(InfoLogLevel::INFO_LEVEL,
                        immutable_db_options_.info_log.get());
   {
+    // Connect to the worker (first use) before taking the DB mutex.
+    (void)GetRemoteDispatcher(dbname_);
     InstrumentedMutexLock l(&mutex_);
 
     num_running_compactions_++;
@@ -3903,15 +4063,25 @@ void DBImpl::BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
       num_running_bottom_compactions_++;
     }
 
-    std::unique_ptr<std::list<uint64_t>::iterator>
-        pending_outputs_inserted_elem(new std::list<uint64_t>::iterator(
-            CaptureCurrentFileNumberInPendingOutputs()));
+    // Released when the compaction is finished: by BackgroundCompaction for a
+    // local compaction, or after the install for an offloaded one
+    // (on_async_done, called under mutex_ from the dispatcher).
+    auto pending_outputs_holder =
+        std::make_shared<std::unique_ptr<std::list<uint64_t>::iterator>>(
+            new std::list<uint64_t>::iterator(
+                CaptureCurrentFileNumberInPendingOutputs()));
+    auto release_pending_outputs = [this, pending_outputs_holder]() {
+      if (*pending_outputs_holder) {
+        ReleaseFileNumberFromPendingOutputs(*pending_outputs_holder);
+      }
+    };
 
     assert((bg_thread_pri == Env::Priority::BOTTOM &&
             bg_bottom_compaction_scheduled_) ||
            (bg_thread_pri == Env::Priority::LOW && bg_compaction_scheduled_));
     Status s = BackgroundCompaction(&made_progress, &job_context, &log_buffer,
-                                    prepicked_compaction, bg_thread_pri);
+                                    prepicked_compaction, bg_thread_pri,
+                                    release_pending_outputs);
     TEST_SYNC_POINT("BackgroundCallCompaction:1");
     if (s.IsBusy()) {
       bg_cv_.SignalAll();  // In case a waiter can proceed despite the error
@@ -3945,8 +4115,6 @@ void DBImpl::BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
       ROCKS_LOG_BUFFER(&log_buffer, "[%s] [JOB %d] Manual compaction paused",
                        m->cfd->GetName().c_str(), job_context.job_id);
     }
-
-    ReleaseFileNumberFromPendingOutputs(pending_outputs_inserted_elem);
 
     // If compaction failed, we want to delete all temporary files that we
     // might have created (they might not be all recorded in job_context in
@@ -4025,7 +4193,21 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
                                     JobContext* job_context,
                                     LogBuffer* log_buffer,
                                     PrepickedCompaction* prepicked_compaction,
-                                    Env::Priority thread_pri) {
+                                    Env::Priority thread_pri,
+                                    std::function<void()> on_async_done) {
+  // Calls on_async_done on every return path, unless the compaction was
+  // handed to the remote worker (then its completion callback calls it).
+  struct AsyncDoneGuard {
+    std::function<void()> fn;
+    bool armed = true;
+    explicit AsyncDoneGuard(std::function<void()> f) : fn(std::move(f)) {}
+    void disarm() { armed = false; }
+    ~AsyncDoneGuard() {
+      if (armed && fn) fn();
+    }
+  } async_done_guard(on_async_done);
+  bool remote_done = false;
+
   ManualCompactionState* manual_compaction =
       prepicked_compaction == nullptr
           ? nullptr
@@ -4692,12 +4874,43 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
         c->column_family_data()->GetFullHistoryTsLow(), c->trim_ts(),
         &blob_callback_, &bg_compaction_scheduled_,
         &bg_bottom_compaction_scheduled_);
-    compaction_job.Prepare(std::nullopt /*subcompact to be computed*/);
+    auto* rc_disp = GetRemoteDispatcher(dbname_);
+    const bool use_remote = ShouldOffload(rc_disp, c.get());
+    if (!use_remote) {
+      // An offloaded compaction is split into subcompactions by the worker.
+      compaction_job.Prepare(std::nullopt /*subcompact to be computed*/);
+    }
 
     std::unique_ptr<std::list<uint64_t>::iterator> min_options_file_number_elem;
     if (immutable_db_options().compaction_service != nullptr) {
       min_options_file_number_elem.reset(
           new std::list<uint64_t>::iterator(CaptureOptionsFileNumber()));
+    }
+
+    // While the DB mutex is still held (atomically with picking), register
+    // the key range the remote job will write, so that no overlapping
+    // compaction is picked before the job is installed.
+    if (rc_disp != nullptr) {
+      const Comparator* ucmp = c->column_family_data()->user_comparator();
+      std::string out_smallest, out_largest;
+      for (size_t li = 0; li < c->num_input_levels(); li++) {
+        for (size_t fi = 0; fi < c->num_input_files(li); fi++) {
+          const FileMetaData* fmd = c->input(li, fi);
+          Slice lo = fmd->smallest.user_key();
+          Slice hi = fmd->largest.user_key();
+          if (out_smallest.empty() ||
+              ucmp->CompareWithoutTimestamp(lo, out_smallest) < 0) {
+            out_smallest = lo.ToString();
+          }
+          if (out_largest.empty() ||
+              ucmp->CompareWithoutTimestamp(hi, out_largest) > 0) {
+            out_largest = hi.ToString();
+          }
+        }
+      }
+      if (!out_smallest.empty()) {
+        c->SetOutputRange(out_smallest, out_largest);
+      }
     }
 
     NotifyOnCompactionBegin(c->column_family_data(), c.get(), status,
@@ -4712,8 +4925,66 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
           "DBImpl::BackgroundCompaction:NonTrivial:BeforeRunBottomPri");
     }
 
-    // Should handle error?
-    compaction_job.Run().PermitUncheckedError();
+    if (use_remote) {
+      auto rc_job = std::make_shared<RemoteCompactionJob>(
+          this, c.get(), c->column_family_data(), rc_disp,
+          directories_.GetDbDir());
+      std::vector<SequenceNumber> snap_seqs;
+      SequenceNumber ewc_snap = kMaxSequenceNumber;
+      {
+        // snapshots_ is guarded by mutex_, which is not held here.
+        InstrumentedMutexLock snap_lk(&mutex_);
+        snap_seqs = snapshots_.GetAll(&ewc_snap);
+      }
+      const int output_level = c->output_level();
+      // The Compaction is shared with the remote job. If the submit fails,
+      // `c` keeps ownership and the compaction runs locally.
+      auto c_own = std::make_shared<std::atomic<bool>>(true);
+      auto c_shared = std::shared_ptr<Compaction>(
+          c.get(), [c_own](Compaction* p) {
+            if (c_own->load()) delete p;
+          });
+      auto* cfd_ptr = c_shared->column_family_data();
+      Status rc_s = rc_job->RunAsync(
+          snap_seqs, ewc_snap, 0, c_shared,
+          [this, c_shared, cfd_ptr, c_own, on_async_done](Status st) mutable {
+            SuperVersionContext sv_ctx(true);
+            JobContext job_ctx(0);
+            InstrumentedMutexLock l(&mutex_);
+            c_shared->ReleaseCompactionFiles(st);
+            InstallSuperVersionAndScheduleWork(cfd_ptr, &sv_ctx);
+            // ~Compaction unrefs Version/cfd, so free it under mutex_.
+            if (c_own->exchange(false)) delete c_shared.get();
+            c_shared.reset();
+            sv_ctx.Clean();
+            if (on_async_done) on_async_done();
+            // Purge the inputs now obsolete (no full scan).
+            FindObsoleteFiles(&job_ctx, false);
+            mutex_.Unlock();
+            if (job_ctx.HaveSomethingToDelete()) {
+              PurgeObsoleteFiles(job_ctx);
+            }
+            job_ctx.Clean();
+            mutex_.Lock();
+          });
+      if (rc_s.ok()) {
+        remote_done = true;
+        (void)c.release();  // owned by c_shared from now on
+        RecordRemoteJob(output_level);
+        async_done_guard.disarm();
+      } else {
+        fprintf(stderr, "[rc] async submit failed, fallback local: %s\n",
+                rc_s.ToString().c_str());
+        c_own->store(false);
+        InstrumentedMutexLock prep_lk(&mutex_);
+        compaction_job.Prepare(std::nullopt /*subcompact to be computed*/);
+      }
+    }
+    if (!remote_done) {
+      // Should handle error?
+      compaction_job.Run().PermitUncheckedError();
+    }
+
     TEST_SYNC_POINT("DBImpl::BackgroundCompaction:NonTrivial:AfterRun");
     mutex_.Lock();
 
@@ -4721,17 +4992,24 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
       ReleaseOptionsFileNumber(min_options_file_number_elem);
     }
 
-    // Fire OnCompactionPreCommit before compaction_job.Install runs
-    // ReleaseCompactionFiles in its manifest write callback.
-    NotifyOnCompactionPreCommit(c->column_family_data(), c.get(), status,
-                                compaction_job_stats, job_context->job_id);
-    status = compaction_job.Install(&compaction_released);
-    io_s = compaction_job.io_status();
-    if (status.ok()) {
-      InstallSuperVersionAndScheduleWork(
-          c->column_family_data(), job_context->superversion_contexts.data());
+    if (remote_done) {
+      // Installed later by the remote job's completion callback.
+      compaction_job.CleanupCompaction();
+      compaction_released = true;
+    } else {
+      // Fire OnCompactionPreCommit before compaction_job.Install runs
+      // ReleaseCompactionFiles in its manifest write callback.
+      NotifyOnCompactionPreCommit(c->column_family_data(), c.get(), status,
+                                  compaction_job_stats, job_context->job_id);
+      status = compaction_job.Install(&compaction_released);
+      io_s = compaction_job.io_status();
+      if (status.ok()) {
+        InstallSuperVersionAndScheduleWork(
+            c->column_family_data(), job_context->superversion_contexts.data());
+      }
     }
     *made_progress = true;
+    if (!remote_done)
     TEST_SYNC_POINT_CALLBACK("DBImpl::BackgroundCompaction:AfterCompaction",
                              c->column_family_data());
   }
