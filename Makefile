@@ -1037,7 +1037,7 @@ watch-log:
 dump-log:
 	bash -c '$(quoted_perl_command)' < LOG
 
-# Machine-parseable progress output for automated monitoring (e.g., Claude Code)
+# Machine-parseable progress output for automated monitoring
 # Outputs JSON: {"status":"running","completed":45,"total":100,"failed":0,"percent":45,"eta_seconds":120}
 check-progress:
 	@build_tools/check_progress.sh
@@ -1264,7 +1264,7 @@ tags0:
 format:
 	build_tools/format-diff.sh
 
-# Non-interactive format (auto-apply without prompts, for CI/automation/Claude Code)
+# Non-interactive format (auto-apply without prompts, for CI/automation)
 format-auto:
 	build_tools/format-diff.sh -y
 
