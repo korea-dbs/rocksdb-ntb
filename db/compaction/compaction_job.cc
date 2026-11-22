@@ -9,6 +9,9 @@
 
 #include "db/compaction/compaction_job.h"
 
+#include <chrono>
+#include <cstdio>
+
 #include <algorithm>
 #include <cinttypes>
 #include <memory>
@@ -62,6 +65,9 @@
 #include "util/stop_watch.h"
 
 namespace ROCKSDB_NAMESPACE {
+// Defined in compaction_service_job.cc (baseline instrumentation).
+extern thread_local std::chrono::steady_clock::time_point rcmp_tls_result_tp;
+extern thread_local bool rcmp_tls_result_set;
 
 const char* GetCompactionReasonString(CompactionReason compaction_reason) {
   switch (compaction_reason) {
@@ -1191,7 +1197,24 @@ Status CompactionJob::Install(bool* compaction_released) {
                                             internal_stats_);
 
   if (status.ok()) {
+    // Baseline instrumentation (remote compactions only).
+    const bool rc_remote = db_options_.compaction_service != nullptr;
+    auto rc_in_t0 = std::chrono::steady_clock::now();
+    if (rcmp_tls_result_set) {
+      fprintf(stderr, "[RCMP_IWAIT] job=%d wait_ms=%.3f\n", job_id_,
+              std::chrono::duration<double, std::milli>(rc_in_t0 -
+                                                        rcmp_tls_result_tp)
+                  .count());
+      rcmp_tls_result_set = false;
+    }
     status = InstallCompactionResults(compaction_released);
+    if (rc_remote) {
+      fprintf(stderr, "[RCMP_INSTALL] job=%d level=%d install_ms=%.3f\n",
+              job_id_, output_level,
+              std::chrono::duration<double, std::milli>(
+                  std::chrono::steady_clock::now() - rc_in_t0)
+                  .count());
+    }
   }
   if (!versions_->io_status().ok()) {
     io_status_ = versions_->io_status();

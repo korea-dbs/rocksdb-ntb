@@ -395,6 +395,7 @@ BENCH_LIB_SOURCES =                                             \
   tools/db_bench_tool.cc                                        \
   tools/tool_hooks.cc                                           \
   tools/simulated_hybrid_file_system.cc                         \
+  tools/nfs_compaction_service.cc                               \
 
 CACHE_BENCH_LIB_SOURCES =                                       \
   cache/cache_bench_tool.cc                                     \

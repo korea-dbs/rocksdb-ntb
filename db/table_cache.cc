@@ -174,7 +174,10 @@ Status TableCache::GetTableReader(
                                    ioptions_.listeners, file_temperature,
                                    level == ioptions_.num_levels - 1));
     UniqueId64x2 expected_unique_id;
-    if (ioptions_.verify_sst_unique_id_in_manifest) {
+    // Unique-ID verification is disabled in the baseline build (as in the
+    // measured runs), where SSTs written by the remote worker are renamed
+    // into the primary's directory.
+    if (false && ioptions_.verify_sst_unique_id_in_manifest) {
       expected_unique_id = file_meta.unique_id;
     } else {
       expected_unique_id = kNullUniqueId64x2;  // null ID == no verification

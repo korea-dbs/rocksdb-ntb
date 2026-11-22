@@ -8,6 +8,12 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <thread>
+#include <vector>
+
 #include "db/compaction/compaction_job.h"
 #include "db/compaction/compaction_state.h"
 #include "logging/logging.h"
@@ -17,6 +23,11 @@
 #include "rocksdb/utilities/options_type.h"
 
 namespace ROCKSDB_NAMESPACE {
+// Baseline instrumentation: time at which the remote result of this thread's
+// compaction was moved into place; CompactionJob::Install() reports the wait
+// from here until the install starts ([RCMP_IWAIT]).
+thread_local std::chrono::steady_clock::time_point rcmp_tls_result_tp;
+thread_local bool rcmp_tls_result_set = false;
 class SubcompactionState;
 
 CompactionServiceJobStatus
@@ -213,6 +224,15 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
       "%s, files: %s",
       compaction->column_family_data()->GetName().c_str(), job_id_,
       compaction_result.output_path.c_str(), output_files_oss.str().c_str());
+  {  // Worker-side output write/sync time (filled only with
+     // report_bg_io_stats=true).
+    uint64_t rc_out_bytes = 0;
+    for (const auto& rc_f : compaction_result.output_files) rc_out_bytes += rc_f.file_size;
+    const auto& rc_st = compaction_result.stats;
+    fprintf(stderr, "[RCMP_WIO] job=%d files=%zu out_mb=%.1f write_ms=%.1f fsync_ms=%.1f range_sync_ms=%.1f prepare_ms=%.1f\n",
+            job_id_, compaction_result.output_files.size(), rc_out_bytes / 1048576.0, rc_st.file_write_nanos / 1e6,
+            rc_st.file_fsync_nanos / 1e6, rc_st.file_range_sync_nanos / 1e6, rc_st.file_prepare_write_nanos / 1e6);
+  }
 
   // Installation Starts
   for (const auto& file : compaction_result.output_files) {
@@ -220,7 +240,14 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
     auto src_file = compaction_result.output_path + "/" + file.file_name;
     auto tgt_file = TableFileName(compaction->immutable_options().cf_paths,
                                   file_num, compaction->output_path_id());
+    auto rc_rn_t0 = std::chrono::steady_clock::now();
     s = fs_->RenameFile(src_file, tgt_file, IOOptions(), nullptr);
+    fprintf(stderr, "[RCMP_RENAME] job=%d rename_ms=%.3f\n", job_id_,
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - rc_rn_t0)
+                .count());
+    rcmp_tls_result_tp = std::chrono::steady_clock::now();
+    rcmp_tls_result_set = true;
     if (!s.ok()) {
       sub_compact->status = s;
       db_options_.compaction_service->OnInstallation(
@@ -346,6 +373,37 @@ void CompactionServiceCompactionJob::Prepare(
   if (compaction_input_.has_end) {
     end = compaction_input_.end;
   }
+  // Baseline worker-side subcompactions (nfs_compaction_worker, RC_WSPLIT):
+  // a job that covers its whole key range may be split into key-range
+  // subcompactions by CompactionJob::Prepare when max_subcompactions > 1.
+  //   RC_WSPLIT_MIN_MB  jobs with less input are not split (default 64)
+  //   RC_WSPLIT_L0ONLY  1 = split only jobs that start at L0
+  static const uint64_t kWsplitMinBytes = [] {
+    const char* e = std::getenv("RC_WSPLIT_MIN_MB");
+    long v = (e && *e) ? std::atol(e) : 64;
+    if (v < 0) v = 0;
+    return static_cast<uint64_t>(v) << 20;
+  }();
+  static const bool kWsplitL0Only = [] {
+    const char* e = std::getenv("RC_WSPLIT_L0ONLY");
+    bool v = e && *e == '1';
+    std::fprintf(stderr, "[rc] v-wsplit-l0: RC_WSPLIT_L0ONLY=%d\n", v ? 1 : 0);
+    return v;
+  }();
+  Compaction* rc_c = compact_->compaction;
+  if (!begin.has_value() && !end.has_value() &&
+      rc_c->max_subcompactions() > 1 &&
+      (!kWsplitL0Only || rc_c->start_level() == 0) &&
+      rc_c->CalculateTotalInputSize() >= kWsplitMinBytes) {
+    CompactionJob::Prepare(std::nullopt, compaction_progress,
+                           compaction_progress_writer);
+    std::fprintf(stderr,
+                 "[rc] v-wsplit: out_level=%d input_mb=%.1f subs=%zu\n",
+                 rc_c->output_level(),
+                 rc_c->CalculateTotalInputSize() / 1048576.0,
+                 compact_->sub_compact_states.size());
+    return;
+  }
   CompactionJob::Prepare(std::make_pair(begin, end), compaction_progress,
                          compaction_progress_writer);
 }
@@ -364,11 +422,20 @@ Status CompactionServiceCompactionJob::Run() {
   const uint64_t start_micros = db_options_.clock->NowMicros();
   c->GetOrInitInputTableProperties();
 
-  // Pick the only sub-compaction we should have
-  assert(compact_->sub_compact_states.size() == 1);
+  // Run every subcompaction (one unless the job was split in Prepare()).
+  assert(!compact_->sub_compact_states.empty());
   SubcompactionState* sub_compact = compact_->sub_compact_states.data();
-
-  ProcessKeyValueCompaction(sub_compact);
+  {
+    std::vector<std::thread> rc_threads;
+    rc_threads.reserve(compact_->sub_compact_states.size() - 1);
+    for (size_t i = 1; i < compact_->sub_compact_states.size(); i++) {
+      SubcompactionState* rc_sc = &compact_->sub_compact_states[i];
+      rc_threads.emplace_back(
+          [this, rc_sc]() { ProcessKeyValueCompaction(rc_sc); });
+    }
+    ProcessKeyValueCompaction(sub_compact);
+    for (auto& t : rc_threads) t.join();
+  }
 
   uint64_t elapsed_micros = db_options_.clock->NowMicros() - start_micros;
   internal_stats_.SetMicros(elapsed_micros);
@@ -379,8 +446,13 @@ Status CompactionServiceCompactionJob::Run() {
   RecordTimeToHistogram(stats_, COMPACTION_CPU_TIME,
                         internal_stats_.output_level_stats.cpu_micros);
 
+  // First error among all subcompactions.
   Status status = sub_compact->status;
   IOStatus io_s = sub_compact->io_status;
+  for (auto& rc_sc : compact_->sub_compact_states) {
+    if (status.ok() && !rc_sc.status.ok()) status = rc_sc.status;
+    if (io_s.ok() && !rc_sc.io_status.ok()) io_s = rc_sc.io_status;
+  }
 
   if (io_status_.ok()) {
     io_status_ = io_s;
@@ -435,7 +507,9 @@ Status CompactionServiceCompactionJob::Run() {
   compaction_result_->output_level = compact_->compaction->output_level();
   compaction_result_->output_path = output_path_;
   if (status.ok()) {
-    for (const auto& output_file : sub_compact->GetOutputs()) {
+    // Outputs of all subcompactions, in key order.
+    for (auto& rc_sc : compact_->sub_compact_states)
+    for (const auto& output_file : rc_sc.GetOutputs()) {
       auto& meta = output_file.meta;
       compaction_result_->output_files.emplace_back(
           MakeTableFileName(meta.fd.GetNumber()), meta.fd.GetFileSize(),

@@ -40,6 +40,7 @@
 #include <unordered_map>
 
 #include "db/db_impl/db_impl.h"
+#include "tools/nfs_compaction_service.h"
 #include "db/malloc_stats.h"
 #include "db/version_set.h"
 #include "monitoring/histogram.h"
@@ -894,6 +895,9 @@ DEFINE_bool(finish_after_writes, false,
             "Write thread terminates after all writes are finished");
 
 DEFINE_bool(sync, false, "Sync all writes to disk");
+
+DEFINE_bool(allow_fallocate, true,
+            "Options.allow_fallocate. The paper runs use false.");
 
 DEFINE_bool(use_fsync, false, "If true, issue fsync instead of fdatasync");
 
@@ -4586,6 +4590,7 @@ class Benchmark {
     options.log_readahead_size = FLAGS_log_readahead_size;
     options.writable_file_max_buffer_size = FLAGS_writable_file_max_buffer_size;
     options.use_fsync = FLAGS_use_fsync;
+    options.allow_fallocate = FLAGS_allow_fallocate;
     options.num_levels = FLAGS_num_levels;
     options.target_file_size_base = FLAGS_target_file_size_base;
     options.target_file_size_multiplier = FLAGS_target_file_size_multiplier;
@@ -5251,6 +5256,11 @@ class Benchmark {
 
   void OpenDb(Options options, ToolHooks& hooks, const std::string& db_name,
               DBWithColumnFamilies* db) {
+    // File-based remote compaction baseline (NFS/GFS2): enabled by
+    // RCMP_SHARED_DIR, see tools/nfs_compaction_service.h.
+    if (const char* rc_dir = getenv("RCMP_SHARED_DIR"); rc_dir && *rc_dir) {
+      options.compaction_service = std::make_shared<NFSCompactionService>();
+    }
     uint64_t open_start = FLAGS_report_open_timing ? FLAGS_env->NowNanos() : 0;
     Status s;
     // Open with column families if necessary.

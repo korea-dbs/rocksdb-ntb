@@ -5,7 +5,12 @@
 
 #include "db/db_impl/db_impl_secondary.h"
 
+#include <time.h>
+
+#include <chrono>
 #include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <optional>
 
 #include "db/arena_wrapped_db_iter.h"
@@ -20,11 +25,16 @@
 #include "logging/logging.h"
 #include "monitoring/perf_context_imp.h"
 #include "rocksdb/convenience.h"
+#include "rocksdb/iostats_context.h"
+#include "rocksdb/perf_level.h"
 #include "rocksdb/utilities/options_util.h"
 #include "util/cast_util.h"
 #include "util/write_batch_util.h"
 
 namespace ROCKSDB_NAMESPACE {
+// Called by OpenAndCompact() between opening the secondary DB and running
+// the compaction (set by nfs_compaction_worker to split its I/O counters).
+void (*g_rcmp_phase_hook)() = nullptr;
 
 DBImplSecondary::DBImplSecondary(const DBOptions& db_options,
                                  const std::string& dbname,
@@ -1546,6 +1556,20 @@ Status DB::OpenAndCompact(
   // We will close the DB after the compaction anyway.
   // Open as many files as needed for the compaction.
   db_options.max_open_files = -1;
+  // Baseline worker-side subcompactions: RC_WSPLIT=K (K > 1) lets one remote
+  // job be split into up to K key-range subcompactions (see
+  // CompactionServiceCompactionJob::Prepare).
+  {
+    static const uint32_t kWsplit = [] {
+      const char* e = std::getenv("RC_WSPLIT");
+      long v = (e && *e) ? std::atol(e) : 0;
+      if (v < 0) v = 0;
+      if (v > 64) v = 64;
+      std::fprintf(stderr, "[rc] v-wsplit: RC_WSPLIT=%ld (0/1=off)\n", v);
+      return static_cast<uint32_t>(v);
+    }();
+    if (kWsplit > 1) db_options.max_subcompactions = kWsplit;
+  }
   db_options.info_log = override_options.info_log;
 
   // 4. Filter CFs that are needed for OpenAndCompact()
@@ -1590,6 +1614,14 @@ Status DB::OpenAndCompact(
   //    needs LSM state from MANIFEST, not memtable data from WAL replay)
   std::unique_ptr<DB> db;
   std::vector<ColumnFamilyHandle*> handles;
+  // Baseline instrumentation: split time, CPU and I/O into the DB open phase
+  // and the compaction phase ([RCMP_IO], [RCMP_CPUPH], [RCMP_IOPH]).
+  const PerfLevel rc_prev_perf = GetPerfLevel();
+  SetPerfLevel(PerfLevel::kEnableTimeExceptForMutex);
+  get_iostats_context()->Reset();
+  auto t_read_start = std::chrono::steady_clock::now();
+  struct timespec rc_cp0;
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &rc_cp0);
   s = DBImplSecondary::OpenAsSecondaryImpl(db_options, name, output_directory,
                                            column_families, &handles, &db,
                                            /*recover_wal=*/false);
@@ -1616,11 +1648,34 @@ Status DB::OpenAndCompact(
   CompactionServiceResult compaction_result;
   DBImplSecondary* db_secondary =
       static_cast_with_check<DBImplSecondary>(db.get());
+  auto t_read_end = std::chrono::steady_clock::now();
+  if (g_rcmp_phase_hook) g_rcmp_phase_hook();
+  struct timespec rc_cp1;
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &rc_cp1);
+  const IOStatsContext* rc_ios = get_iostats_context();
+  const uint64_t rc_o_rn = rc_ios->read_nanos, rc_o_rb = rc_ios->bytes_read, rc_o_on = rc_ios->open_nanos;
+  const uint64_t rc_o_wn = rc_ios->write_nanos, rc_o_wb = rc_ios->bytes_written;
   s = db_secondary->CompactWithoutInstallation(options, cfh, compaction_input,
                                                &compaction_result);
+  auto t_compact_end = std::chrono::steady_clock::now();
+  struct timespec rc_cp2;
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &rc_cp2);
+  const uint64_t rc_c_rn = rc_ios->read_nanos - rc_o_rn, rc_c_rb = rc_ios->bytes_read - rc_o_rb;
+  const uint64_t rc_c_on = rc_ios->open_nanos - rc_o_on, rc_c_wn = rc_ios->write_nanos - rc_o_wn;
+  const uint64_t rc_c_wb = rc_ios->bytes_written - rc_o_wb, rc_c_fn = rc_ios->fsync_nanos;
+  SetPerfLevel(rc_prev_perf);
 
   // 8. Serialize the result
   Status serialization_status = compaction_result.Write(output);
+  long rcmp_read_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_read_end - t_read_start).count();
+  long rcmp_write_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_compact_end - t_read_end).count();
+  fprintf(stderr, "[RCMP_IO] read_ms=%ld write_ms=%ld\n", rcmp_read_ms, rcmp_write_ms);
+  fprintf(stderr, "[RCMP_CPUPH] open_cpu_ms=%.1f cmp_cpu_ms=%.1f\n",
+          (rc_cp1.tv_sec - rc_cp0.tv_sec) * 1e3 + (rc_cp1.tv_nsec - rc_cp0.tv_nsec) / 1e6,
+          (rc_cp2.tv_sec - rc_cp1.tv_sec) * 1e3 + (rc_cp2.tv_nsec - rc_cp1.tv_nsec) / 1e6);
+  fprintf(stderr, "[RCMP_IOPH] open_read_ms=%.1f open_read_mb=%.1f open_fopen_ms=%.1f cmp_read_ms=%.1f cmp_read_mb=%.1f cmp_fopen_ms=%.1f cmp_write_ms=%.1f cmp_write_mb=%.1f fsync_ms=%.1f\n",
+          rc_o_rn / 1e6, rc_o_rb / 1e6, rc_o_on / 1e6, rc_c_rn / 1e6, rc_c_rb / 1e6, rc_c_on / 1e6,
+          rc_c_wn / 1e6, rc_c_wb / 1e6, rc_c_fn / 1e6);
 
   // 9. Close the db and return
   for (auto& handle : handles) {

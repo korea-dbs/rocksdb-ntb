@@ -27,4 +27,11 @@ if(WITH_TOOLS)
   add_custom_target(ldb_tests
     COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/ldb_tests.py
     DEPENDS ldb)
+
+  # Worker of the file-based remote compaction baseline (NFS/GFS2).
+  add_executable(nfs_compaction_worker${ARTIFACT_SUFFIX}
+    nfs_compaction_worker.cc)
+  target_link_libraries(nfs_compaction_worker${ARTIFACT_SUFFIX}
+    ${ROCKSDB_LIB} ${THIRDPARTY_LIBS})
+  list(APPEND tool_deps nfs_compaction_worker)
 endif()

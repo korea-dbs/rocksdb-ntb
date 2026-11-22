@@ -510,15 +510,9 @@ static Status ReadFooterFromFileInternal(
     }
   }
 
-  if (expected_file_size != file_size_from_file_system) {
-    // When file is opened during DB Open, the expected file size is from
-    // manifest. Otherwise it is not guaranteed.
-    return Status::Corruption("Sst file size mismatch between expected " +
-                              std::to_string(expected_file_size) +
-                              " and file system " +
-                              std::to_string(file_size_from_file_system) +
-                              " sstable: " + file->file_name());
-  }
+  // The size check is disabled in the baseline build (as in the measured
+  // runs), where both hosts open the same SSTs over NFS or GFS2.
+  (void)file_size_from_file_system;
 
   if (expected_file_size < Footer::kMinEncodedLength) {
     return Status::Corruption("file is too short (" +

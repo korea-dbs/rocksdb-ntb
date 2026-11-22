@@ -10,6 +10,8 @@
 #include "db/compaction/compaction.h"
 
 #include <cinttypes>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 #include "db/column_family.h"
@@ -934,6 +936,20 @@ bool Compaction::ShouldFormSubcompactions() const {
   }
 
   if (cfd_->ioptions().compaction_style == kCompactionStyleLevel) {
+    // Baseline option for the "subcompactions at every level" runs:
+    // RC_SUB_MIN_MB > 0 also lets a compaction that does not start at L0 form
+    // subcompactions when its input is at least that large (0 = upstream rule).
+    static const uint64_t kSubAnyMinBytes = [] {
+      const char* e = std::getenv("RC_SUB_MIN_MB");
+      long v = (e && *e) ? std::atol(e) : 0;
+      if (v < 0) v = 0;
+      std::fprintf(stderr, "[rc] v-subany: RC_SUB_MIN_MB=%ld (0=off)\n", v);
+      return static_cast<uint64_t>(v) << 20;
+    }();
+    if (kSubAnyMinBytes > 0 && output_level_ > 0 &&
+        CalculateTotalInputSize() >= kSubAnyMinBytes) {
+      return true;
+    }
     return (start_level_ == 0 || is_manual_compaction_) && output_level_ > 0;
   } else if (cfd_->ioptions().compaction_style == kCompactionStyleUniversal) {
     return number_levels_ > 1 && output_level_ > 0;
