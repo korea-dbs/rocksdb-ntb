@@ -135,6 +135,20 @@ IO="--num=50000000 --writes=50000000 --value_size=1024 \
 Below, `$W` is `$CPU` or `$IO`, `T` is the worker thread count (8 or 16) and
 `M` the minimum job input for subcompactions in MiB.
 
+## Preliminary Results
+
+Throughput (ops/s) of `db_bench overwrite` for 600 s on the CPU-bound and I/O-bound
+workloads described above. NFS and NTB run RocksDB remote compaction as released
+(NTB: PCIe NTB with GFS2); NTB-Native is this repository.
+`nosub`: no subcompactions, `subL0`: L0→L1 only, `suball`: every level.
+
+| System | CPU nosub | CPU subL0 | CPU suball | I/O nosub | I/O subL0 | I/O suball |
+|---|---|---|---|---|---|---|
+| Local | 276,831 | 290,041 | 243,378 | 54,832 | 68,790 | 65,441 |
+| NFS | 330,705 | 330,825 | 327,713 | 52,659 | 51,355 | 53,186 |
+| NTB | 369,284 | 327,235 | 312,669 | 49,111 | 52,927 | 56,152 |
+| NTB-Native | 414,455 | 449,816 | 442,956 | 73,283 | 136,014 | 129,768 |
+
 ## Running the systems
 
 Each system is run without subcompactions, with subcompactions only for
@@ -183,19 +197,6 @@ The worker retries the connection to the primary for up to five minutes.
 Per job, the primary prints `[timing]` lines and the worker
 `[worker][timing]` lines; the time breakdowns in the paper come from them.
 
-## Preliminary Results
-
-Throughput (ops/s) of `db_bench overwrite` for 600 s on the CPU-bound and I/O-bound
-workloads described above. NFS and NTB run RocksDB remote compaction as released
-(NTB: PCIe NTB with GFS2); NTB-Native is this repository.
-`nosub`: no subcompactions, `subL0`: L0→L1 only, `suball`: every level.
-
-| System | CPU nosub | CPU subL0 | CPU suball | I/O nosub | I/O subL0 | I/O suball |
-|---|---|---|---|---|---|---|
-| Local | 276,831 | 290,041 | 243,378 | 54,832 | 68,790 | 65,441 |
-| NFS | 330,705 | 330,825 | 327,713 | 52,659 | 51,355 | 53,186 |
-| NTB | 369,284 | 327,235 | 312,669 | 49,111 | 52,927 | 56,152 |
-| NTB-Native | 414,455 | 449,816 | 442,956 | 73,283 | 136,014 | 129,768 |
 
 ### NFS and GFS2 (`baseline` on both hosts)
 
