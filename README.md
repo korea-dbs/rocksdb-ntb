@@ -133,7 +133,7 @@ IO="--num=50000000 --writes=50000000 --value_size=1024 \
 ```
 
 Below, `$W` is `$CPU` or `$IO`, `T` is the worker thread count (8 or 16) and
-`M` the minimum job input for subcompactions in MiB (16 or 64).
+`M` the minimum job input for subcompactions in MiB.
 
 ## Running the systems
 
